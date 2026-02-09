@@ -1,0 +1,192 @@
+package rdma
+
+import (
+	"context"
+	"errors"
+	"net"
+	"os"
+	"sync"
+	"time"
+)
+
+// MessageConn models an ordered, reliable message channel that can be adapted
+// into a byte-stream net.Conn.
+//
+// RecvMessage should block until one message is available or the context is
+// done. Returned message data should not be mutated after return.
+type MessageConn interface {
+	SendMessage(ctx context.Context, payload []byte) error
+	RecvMessage(ctx context.Context) ([]byte, error)
+	Close() error
+	LocalAddr() net.Addr
+	RemoteAddr() net.Addr
+}
+
+// Conn adapts a MessageConn into net.Conn semantics so it can be used by
+// net/http transports.
+type Conn struct {
+	stream MessageConn
+
+	readMu  sync.Mutex
+	writeMu sync.Mutex
+
+	closeOnce sync.Once
+	closeErr  error
+
+	readBuf []byte
+
+	deadlineMu    sync.RWMutex
+	readDeadline  time.Time
+	writeDeadline time.Time
+}
+
+var _ net.Conn = (*Conn)(nil)
+
+// NewConn wraps a MessageConn into a net.Conn.
+func NewConn(stream MessageConn) *Conn {
+	return &Conn{stream: stream}
+}
+
+func (c *Conn) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if c.stream == nil {
+		return 0, net.ErrClosed
+	}
+
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+
+	for len(c.readBuf) == 0 {
+		msg, err := c.recvWithDeadline()
+		if err != nil {
+			return 0, err
+		}
+		if len(msg) == 0 {
+			continue
+		}
+		c.readBuf = msg
+	}
+
+	n := copy(p, c.readBuf)
+	c.readBuf = c.readBuf[n:]
+	if len(c.readBuf) == 0 {
+		c.readBuf = nil
+	}
+
+	return n, nil
+}
+
+func (c *Conn) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if c.stream == nil {
+		return 0, net.ErrClosed
+	}
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	ctx, cancel := c.contextWithDeadline(c.getWriteDeadline())
+	defer cancel()
+
+	payload := append([]byte(nil), p...)
+	if err := c.stream.SendMessage(ctx, payload); err != nil {
+		return 0, normalizeContextErr(err)
+	}
+
+	return len(p), nil
+}
+
+func (c *Conn) Close() error {
+	c.closeOnce.Do(func() {
+		if c.stream == nil {
+			c.closeErr = net.ErrClosed
+			return
+		}
+		c.closeErr = c.stream.Close()
+	})
+	return c.closeErr
+}
+
+func (c *Conn) LocalAddr() net.Addr {
+	if c.stream == nil {
+		return nil
+	}
+	return c.stream.LocalAddr()
+}
+
+func (c *Conn) RemoteAddr() net.Addr {
+	if c.stream == nil {
+		return nil
+	}
+	return c.stream.RemoteAddr()
+}
+
+func (c *Conn) SetDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	c.readDeadline = t
+	c.writeDeadline = t
+	c.deadlineMu.Unlock()
+	return nil
+}
+
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	c.readDeadline = t
+	c.deadlineMu.Unlock()
+	return nil
+}
+
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	c.writeDeadline = t
+	c.deadlineMu.Unlock()
+	return nil
+}
+
+func (c *Conn) recvWithDeadline() ([]byte, error) {
+	if c.stream == nil {
+		return nil, net.ErrClosed
+	}
+
+	ctx, cancel := c.contextWithDeadline(c.getReadDeadline())
+	defer cancel()
+
+	msg, err := c.stream.RecvMessage(ctx)
+	if err != nil {
+		return nil, normalizeContextErr(err)
+	}
+
+	buf := make([]byte, len(msg))
+	copy(buf, msg)
+	return buf, nil
+}
+
+func (c *Conn) getReadDeadline() time.Time {
+	c.deadlineMu.RLock()
+	defer c.deadlineMu.RUnlock()
+	return c.readDeadline
+}
+
+func (c *Conn) getWriteDeadline() time.Time {
+	c.deadlineMu.RLock()
+	defer c.deadlineMu.RUnlock()
+	return c.writeDeadline
+}
+
+func (c *Conn) contextWithDeadline(deadline time.Time) (context.Context, context.CancelFunc) {
+	if deadline.IsZero() {
+		return context.WithCancel(context.Background())
+	}
+	return context.WithDeadline(context.Background(), deadline)
+}
+
+func normalizeContextErr(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return os.ErrDeadlineExceeded
+	}
+	return err
+}

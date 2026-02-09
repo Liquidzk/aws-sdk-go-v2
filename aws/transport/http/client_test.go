@@ -1,9 +1,13 @@
 package http
 
 import (
+	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,6 +46,101 @@ func TestBuildableClient_WithTimeout(t *testing.T) {
 
 	if e, a := expect, client2.GetTimeout(); e != a {
 		t.Errorf("expect %v timeout, got %v", e, a)
+	}
+}
+
+func TestBuildableClient_WithDialContext(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+	defer server.Close()
+
+	var called int32
+	client := NewBuildableClient().
+		WithTransportOptions(func(tr *http.Transport) {
+			tr.Proxy = nil
+		}).
+		WithDialContext(func(ctx context.Context, network, addr string) (net.Conn, error) {
+			atomic.AddInt32(&called, 1)
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		})
+
+	req, _ := http.NewRequest("GET", server.URL, nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("expect no error, got %v", err)
+	}
+	defer resp.Body.Close()
+
+	if e, a := http.StatusOK, resp.StatusCode; e != a {
+		t.Fatalf("expect %v code, got %v", e, a)
+	}
+
+	if atomic.LoadInt32(&called) == 0 {
+		t.Fatalf("expect custom dial context to be called")
+	}
+}
+
+func TestBuildableClient_WithDialContext_PreservedWhenDialerOptionsApplied(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+	defer server.Close()
+
+	var called int32
+	client := NewBuildableClient().
+		WithTransportOptions(func(tr *http.Transport) {
+			tr.Proxy = nil
+		}).
+		WithDialContext(func(ctx context.Context, network, addr string) (net.Conn, error) {
+			atomic.AddInt32(&called, 1)
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		}).
+		WithDialerOptions(func(d *net.Dialer) {
+			d.Timeout = 2 * time.Second
+		})
+
+	req, _ := http.NewRequest("GET", server.URL, nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("expect no error, got %v", err)
+	}
+	defer resp.Body.Close()
+
+	if atomic.LoadInt32(&called) == 0 {
+		t.Fatalf("expect custom dial context to remain active after WithDialerOptions")
+	}
+}
+
+func TestBuildableClient_WithDialContextNil_ClearsOverride(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+	defer server.Close()
+
+	var called int32
+	client := NewBuildableClient().
+		WithTransportOptions(func(tr *http.Transport) {
+			tr.Proxy = nil
+		}).
+		WithDialContext(func(ctx context.Context, network, addr string) (net.Conn, error) {
+			atomic.AddInt32(&called, 1)
+			return nil, errors.New("unexpected custom dial context call")
+		}).
+		WithDialContext(nil)
+
+	req, _ := http.NewRequest("GET", server.URL, nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("expect no error, got %v", err)
+	}
+	defer resp.Body.Close()
+
+	if atomic.LoadInt32(&called) != 0 {
+		t.Fatalf("expect custom dial context to be cleared")
 	}
 }
 

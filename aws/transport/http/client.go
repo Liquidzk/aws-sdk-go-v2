@@ -42,8 +42,9 @@ var (
 // of the BuildableClient. Only exported member values of the Transport and
 // optional Dialer will be copied between copies of BuildableClient.
 type BuildableClient struct {
-	transport *http.Transport
-	dialer    *net.Dialer
+	transport   *http.Transport
+	dialer      *net.Dialer
+	dialContext dialContext
 
 	initOnce sync.Once
 
@@ -92,6 +93,7 @@ func (b *BuildableClient) clone() *BuildableClient {
 	cpy := NewBuildableClient()
 	cpy.transport = b.GetTransport()
 	cpy.dialer = b.GetDialer()
+	cpy.dialContext = b.dialContext
 	cpy.clientTimeout = b.clientTimeout
 
 	return cpy
@@ -128,7 +130,31 @@ func (b *BuildableClient) WithDialerOptions(opts ...func(*net.Dialer)) *Buildabl
 	cpy.dialer = dialer
 
 	tr := cpy.GetTransport()
-	tr.DialContext = cpy.dialer.DialContext
+	if cpy.dialContext != nil {
+		tr.DialContext = cpy.dialContext
+	} else {
+		tr.DialContext = cpy.dialer.DialContext
+	}
+	cpy.transport = tr
+
+	return cpy
+}
+
+// WithDialContext copies the BuildableClient and returns it with the
+// provided dial function applied to the client's http.Transport.
+//
+// If dialContext is nil, this method clears any previously configured
+// custom dial function and uses the client's current net.Dialer behavior.
+func (b *BuildableClient) WithDialContext(dialContext func(context.Context, string, string) (net.Conn, error)) *BuildableClient {
+	cpy := b.clone()
+	cpy.dialContext = dialContext
+
+	tr := cpy.GetTransport()
+	if cpy.dialContext != nil {
+		tr.DialContext = cpy.dialContext
+	} else {
+		tr.DialContext = cpy.GetDialer().DialContext
+	}
 	cpy.transport = tr
 
 	return cpy
