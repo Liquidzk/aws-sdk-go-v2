@@ -1,0 +1,83 @@
+package rdma
+
+import (
+	"context"
+	"strings"
+	"testing"
+)
+
+func TestVerbsOptionsNormalizeDefaults(t *testing.T) {
+	cfg, err := (VerbsOptions{}).normalize()
+	if err != nil {
+		t.Fatalf("normalize failed: %v", err)
+	}
+
+	if cfg.framePayloadSize != DefaultVerbsFramePayloadSize {
+		t.Fatalf("frame payload default = %d", cfg.framePayloadSize)
+	}
+	if cfg.sendQueueDepth != DefaultVerbsSendQueueDepth {
+		t.Fatalf("send queue depth default = %d", cfg.sendQueueDepth)
+	}
+	if cfg.recvQueueDepth != DefaultVerbsRecvQueueDepth {
+		t.Fatalf("recv queue depth default = %d", cfg.recvQueueDepth)
+	}
+	if cfg.inlineThreshold != DefaultVerbsInlineThreshold {
+		t.Fatalf("inline threshold default = %d", cfg.inlineThreshold)
+	}
+}
+
+func TestVerbsOptionsNormalizeValidation(t *testing.T) {
+	cases := []VerbsOptions{
+		{FramePayloadSize: -1},
+		{SendQueueDepth: -1},
+		{RecvQueueDepth: -1},
+		{InlineThreshold: -2},
+	}
+
+	for i, tc := range cases {
+		if _, err := tc.normalize(); err == nil {
+			t.Fatalf("case %d expected validation error", i)
+		}
+	}
+}
+
+func TestSplitHostPortAddress(t *testing.T) {
+	host, port, err := splitHostPortAddress("tcp", "10.0.1.1:7471")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if host != "10.0.1.1" || port != "7471" {
+		t.Fatalf("unexpected split host=%q port=%q", host, port)
+	}
+
+	_, _, err = splitHostPortAddress("udp", "10.0.1.1:7471")
+	if err == nil {
+		t.Fatalf("expected unsupported network error")
+	}
+
+	_, _, err = splitHostPortAddress("tcp", "invalid")
+	if err == nil {
+		t.Fatalf("expected invalid address error")
+	}
+}
+
+func TestVerbsOpenUnavailableByDefaultBuild(t *testing.T) {
+	if verbsBackendEnabled {
+		t.Skip("verbs backend enabled for this build")
+	}
+
+	_, err := (VerbsOptions{}).Open(context.Background(), "tcp", "10.0.1.1:7471")
+	if err == nil {
+		t.Fatalf("expected unavailable error in non-rdma build")
+	}
+	if !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestNewVerbsDialer(t *testing.T) {
+	d := NewVerbsDialer(VerbsOptions{})
+	if d.Open == nil {
+		t.Fatalf("expected Open to be configured")
+	}
+}

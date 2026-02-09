@@ -4,13 +4,20 @@ package s3
 
 import (
 	"context"
+	"errors"
+	"io/ioutil"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	awsrdmahttp "github.com/aws/aws-sdk-go-v2/aws/transport/http/rdma"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
-	"io/ioutil"
-	"net/http"
-	"strings"
-	"testing"
 )
 
 func TestClient_resolveRetryOptions(t *testing.T) {
@@ -123,5 +130,169 @@ func TestClient_resolveRetryOptions(t *testing.T) {
 				t.Fatalf("expect no operation error, got %v", err)
 			}
 		})
+	}
+}
+
+func TestClient_resolveHTTPClient_RDMATransportFallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	var openCalled int32
+	var fallbackCalled int32
+
+	client := New(Options{
+		Region:              "us-west-2",
+		EnableRDMATransport: true,
+		HTTPClient: awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
+			tr.Proxy = nil
+		}),
+		RDMADialer: awsrdmahttp.Dialer{
+			Open: func(ctx context.Context, network, address string) (awsrdmahttp.MessageConn, error) {
+				atomic.AddInt32(&openCalled, 1)
+				return nil, errors.New("rdma unavailable")
+			},
+			FallbackDialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				atomic.AddInt32(&fallbackCalled, 1)
+				return (&net.Dialer{}).DialContext(ctx, network, address)
+			},
+		},
+	})
+
+	buildable := client.options.HTTPClient.(*awshttp.BuildableClient)
+	req, _ := http.NewRequest("GET", srv.URL, nil)
+	resp, err := buildable.Do(req)
+	if err != nil {
+		t.Fatalf("expect no error, got %v", err)
+	}
+	defer resp.Body.Close()
+
+	if e, a := http.StatusOK, resp.StatusCode; e != a {
+		t.Fatalf("expect status %v, got %v", e, a)
+	}
+
+	if atomic.LoadInt32(&openCalled) == 0 {
+		t.Fatalf("expected RDMA Open to be called")
+	}
+	if atomic.LoadInt32(&fallbackCalled) == 0 {
+		t.Fatalf("expected fallback dial to be called")
+	}
+}
+
+func TestClient_resolveHTTPClient_RDMATransportDisableFallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	var openCalled int32
+	var fallbackCalled int32
+
+	client := New(Options{
+		Region:              "us-west-2",
+		EnableRDMATransport: true,
+		HTTPClient: awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
+			tr.Proxy = nil
+		}),
+		RDMADialer: awsrdmahttp.Dialer{
+			DisableFallback: true,
+			Open: func(ctx context.Context, network, address string) (awsrdmahttp.MessageConn, error) {
+				atomic.AddInt32(&openCalled, 1)
+				return nil, errors.New("rdma disabled")
+			},
+			FallbackDialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				atomic.AddInt32(&fallbackCalled, 1)
+				return (&net.Dialer{}).DialContext(ctx, network, address)
+			},
+		},
+	})
+
+	buildable := client.options.HTTPClient.(*awshttp.BuildableClient)
+	req, _ := http.NewRequest("GET", srv.URL, nil)
+	_, err := buildable.Do(req)
+	if err == nil {
+		t.Fatalf("expected dial error")
+	}
+
+	if atomic.LoadInt32(&openCalled) == 0 {
+		t.Fatalf("expected RDMA Open to be called")
+	}
+	if atomic.LoadInt32(&fallbackCalled) != 0 {
+		t.Fatalf("expected fallback dial not to be called")
+	}
+}
+
+func TestClient_resolveHTTPClient_RDMATransportEnabledByEnv(t *testing.T) {
+	t.Setenv(awsS3EnableRDMATransportEnv, "true")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	var fallbackCalled int32
+
+	client := New(Options{
+		Region: "us-west-2",
+		HTTPClient: awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
+			tr.Proxy = nil
+		}),
+		RDMADialer: awsrdmahttp.Dialer{
+			FallbackDialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				atomic.AddInt32(&fallbackCalled, 1)
+				return (&net.Dialer{}).DialContext(ctx, network, address)
+			},
+		},
+	})
+
+	buildable := client.options.HTTPClient.(*awshttp.BuildableClient)
+	req, _ := http.NewRequest("GET", srv.URL, nil)
+	resp, err := buildable.Do(req)
+	if err != nil {
+		t.Fatalf("expect no error, got %v", err)
+	}
+	defer resp.Body.Close()
+
+	if atomic.LoadInt32(&fallbackCalled) == 0 {
+		t.Fatalf("expected fallback dial to be called when env enables RDMA transport")
+	}
+}
+
+func TestClient_resolveHTTPClient_RDMATransportDisabledByEnv(t *testing.T) {
+	t.Setenv(awsS3EnableRDMATransportEnv, "false")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	var openCalled int32
+
+	client := New(Options{
+		Region:              "us-west-2",
+		EnableRDMATransport: true,
+		HTTPClient: awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
+			tr.Proxy = nil
+		}),
+		RDMADialer: awsrdmahttp.Dialer{
+			DisableFallback: true,
+			Open: func(ctx context.Context, network, address string) (awsrdmahttp.MessageConn, error) {
+				atomic.AddInt32(&openCalled, 1)
+				return nil, errors.New("rdma should be disabled by env")
+			},
+		},
+	})
+
+	buildable := client.options.HTTPClient.(*awshttp.BuildableClient)
+	req, _ := http.NewRequest("GET", srv.URL, nil)
+	resp, err := buildable.Do(req)
+	if err != nil {
+		t.Fatalf("expect no error, got %v", err)
+	}
+	defer resp.Body.Close()
+
+	if atomic.LoadInt32(&openCalled) != 0 {
+		t.Fatalf("expected RDMA Open not to be called when env disables RDMA transport")
 	}
 }

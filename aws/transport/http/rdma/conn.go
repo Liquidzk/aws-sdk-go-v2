@@ -14,6 +14,8 @@ import (
 //
 // RecvMessage should block until one message is available or the context is
 // done. Returned message data should not be mutated after return.
+//
+// SendMessage implementations must not retain payload after returning.
 type MessageConn interface {
 	SendMessage(ctx context.Context, payload []byte) error
 	RecvMessage(ctx context.Context) ([]byte, error)
@@ -92,8 +94,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 	ctx, cancel := c.contextWithDeadline(c.getWriteDeadline())
 	defer cancel()
 
-	payload := append([]byte(nil), p...)
-	if err := c.stream.SendMessage(ctx, payload); err != nil {
+	if err := c.stream.SendMessage(ctx, p); err != nil {
 		return 0, normalizeContextErr(err)
 	}
 
@@ -160,9 +161,7 @@ func (c *Conn) recvWithDeadline() ([]byte, error) {
 		return nil, normalizeContextErr(err)
 	}
 
-	buf := make([]byte, len(msg))
-	copy(buf, msg)
-	return buf, nil
+	return msg, nil
 }
 
 func (c *Conn) getReadDeadline() time.Time {
