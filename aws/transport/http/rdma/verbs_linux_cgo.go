@@ -9,6 +9,7 @@ package rdma
 #include <errno.h>
 #include <infiniband/verbs.h>
 #include <netdb.h>
+#include <poll.h>
 #include <rdma/rdma_cma.h>
 #include <rdma/rdma_verbs.h>
 #include <stdarg.h>
@@ -16,9 +17,12 @@ package rdma
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 enum {
 	GO_RDMA_FRAME_HEADER_SIZE = 12,
+	GO_RDMA_POLL_SPINS = 64,
+	GO_RDMA_POLL_SLEEP_US = 50,
 };
 
 typedef struct {
@@ -28,6 +32,11 @@ typedef struct {
 
 typedef struct {
 	struct rdma_cm_id *id;
+	struct rdma_event_channel *cm_channel;
+	struct ibv_pd *pd;
+	struct ibv_cq *send_cq;
+	struct ibv_cq *recv_cq;
+	int manual_resources;
 	uint8_t *send_buf;
 	struct ibv_mr *send_mr;
 	go_rdma_recv_slot *recv_slots;
@@ -37,6 +46,14 @@ typedef struct {
 	uint32_t last_recv_slot;
 	int has_last_recv_slot;
 } go_rdma_conn;
+
+typedef struct {
+	struct rdma_cm_id *listen_id;
+	uint32_t frame_cap;
+	uint32_t send_wr;
+	uint32_t recv_wr;
+	uint32_t inline_threshold;
+} go_rdma_listener;
 
 static void go_rdma_set_err(char **err_out, const char *fmt, ...) {
 	if (err_out == NULL) {
@@ -74,6 +91,181 @@ static void go_rdma_set_errno(char **err_out, const char *op) {
 	go_rdma_set_err(err_out, "%s: %s", op, strerror(errno));
 }
 
+static int64_t go_rdma_now_monotonic_us(void) {
+	struct timespec ts;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+		return -1;
+	}
+	return ((int64_t)ts.tv_sec * 1000000LL) + ((int64_t)ts.tv_nsec / 1000LL);
+}
+
+static int go_rdma_sleep_us(int64_t sleep_us) {
+	if (sleep_us <= 0) {
+		return 0;
+	}
+
+	struct timespec ts;
+	ts.tv_sec = (time_t)(sleep_us / 1000000LL);
+	ts.tv_nsec = (long)((sleep_us % 1000000LL) * 1000LL);
+
+	while (nanosleep(&ts, &ts) != 0) {
+		if (errno == EINTR) {
+			continue;
+		}
+		return -1;
+	}
+
+	return 0;
+}
+
+static int go_rdma_poll_cq_with_timeout(
+	struct ibv_cq *cq,
+	struct ibv_wc *wc,
+	int timeout_ms,
+	const char *op,
+	char **err_out
+) {
+	if (cq == NULL || wc == NULL) {
+		go_rdma_set_err(err_out, "%s: invalid cq/wc", op);
+		return EINVAL;
+	}
+
+	int64_t deadline_us = -1;
+	if (timeout_ms >= 0) {
+		int64_t now_us = go_rdma_now_monotonic_us();
+		if (now_us < 0) {
+			go_rdma_set_errno(err_out, "clock_gettime");
+			return errno != 0 ? errno : EIO;
+		}
+		deadline_us = now_us + ((int64_t)timeout_ms * 1000LL);
+	}
+
+	int spins = 0;
+	for (;;) {
+		int n = ibv_poll_cq(cq, 1, wc);
+		if (n > 0) {
+			return 0;
+		}
+		if (n < 0) {
+			go_rdma_set_errno(err_out, op);
+			return errno != 0 ? errno : EIO;
+		}
+
+		if (deadline_us >= 0) {
+			int64_t now_us = go_rdma_now_monotonic_us();
+			if (now_us < 0) {
+				go_rdma_set_errno(err_out, "clock_gettime");
+				return errno != 0 ? errno : EIO;
+			}
+			if (now_us >= deadline_us) {
+				return EAGAIN;
+			}
+		}
+
+		if (spins < GO_RDMA_POLL_SPINS) {
+			spins++;
+			continue;
+		}
+
+		if (go_rdma_sleep_us(GO_RDMA_POLL_SLEEP_US) != 0) {
+			go_rdma_set_errno(err_out, "nanosleep");
+			return errno != 0 ? errno : EIO;
+		}
+	}
+}
+
+static int go_rdma_wait_cm_event(
+	struct rdma_event_channel *channel,
+	int timeout_ms,
+	enum rdma_cm_event_type expected,
+	const char *op,
+	char **err_out
+) {
+	if (channel == NULL) {
+		go_rdma_set_err(err_out, "%s: nil event channel", op);
+		return EINVAL;
+	}
+
+	struct pollfd pfd;
+	memset(&pfd, 0, sizeof(pfd));
+	pfd.fd = channel->fd;
+	pfd.events = POLLIN;
+
+	int poll_timeout = timeout_ms;
+	if (poll_timeout < 0) {
+		poll_timeout = -1;
+	}
+
+	int rc;
+	do {
+		rc = poll(&pfd, 1, poll_timeout);
+	} while (rc < 0 && errno == EINTR);
+
+	if (rc == 0) {
+		go_rdma_set_err(err_out, "%s: timed out waiting cm event %s", op, rdma_event_str(expected));
+		return EAGAIN;
+	}
+	if (rc < 0) {
+		go_rdma_set_errno(err_out, "poll(cm_event)");
+		return errno != 0 ? errno : EIO;
+	}
+
+	struct rdma_cm_event *event = NULL;
+	rc = rdma_get_cm_event(channel, &event);
+	if (rc != 0) {
+		go_rdma_set_errno(err_out, "rdma_get_cm_event");
+		return errno != 0 ? errno : EIO;
+	}
+
+	enum rdma_cm_event_type actual = event->event;
+	int status = event->status;
+	rdma_ack_cm_event(event);
+
+	if (actual != expected) {
+		go_rdma_set_err(
+			err_out,
+			"%s: unexpected cm event=%s expected=%s status=%d",
+			op,
+			rdma_event_str(actual),
+			rdma_event_str(expected),
+			status
+		);
+		return EIO;
+	}
+	if (status != 0) {
+		go_rdma_set_err(
+			err_out,
+			"%s: cm event=%s status=%d",
+			op,
+			rdma_event_str(actual),
+			status
+		);
+		return EIO;
+	}
+
+	return 0;
+}
+
+static struct ibv_cq *go_rdma_send_cq(go_rdma_conn *conn) {
+	if (conn == NULL || conn->id == NULL) {
+		return NULL;
+	}
+	if (conn->send_cq != NULL) {
+		return conn->send_cq;
+	}
+	return conn->id->send_cq;
+}
+
+static struct ibv_cq *go_rdma_recv_cq(go_rdma_conn *conn) {
+	if (conn == NULL || conn->id == NULL) {
+		return NULL;
+	}
+	if (conn->recv_cq != NULL) {
+		return conn->recv_cq;
+	}
+	return conn->id->recv_cq;
+}
+
 static void go_rdma_free_conn(go_rdma_conn *conn) {
 	if (conn == NULL) {
 		return;
@@ -109,11 +301,48 @@ static void go_rdma_free_conn(go_rdma_conn *conn) {
 	}
 
 	if (conn->id != NULL) {
-		rdma_destroy_ep(conn->id);
+		if (conn->manual_resources) {
+			if (conn->id->qp != NULL) {
+				rdma_destroy_qp(conn->id);
+			}
+			if (conn->send_cq != NULL) {
+				ibv_destroy_cq(conn->send_cq);
+				conn->send_cq = NULL;
+			}
+			if (conn->recv_cq != NULL) {
+				ibv_destroy_cq(conn->recv_cq);
+				conn->recv_cq = NULL;
+			}
+			if (conn->pd != NULL) {
+				ibv_dealloc_pd(conn->pd);
+				conn->pd = NULL;
+			}
+			rdma_destroy_id(conn->id);
+		} else {
+			rdma_destroy_ep(conn->id);
+		}
 		conn->id = NULL;
 	}
 
+	if (conn->cm_channel != NULL) {
+		rdma_destroy_event_channel(conn->cm_channel);
+		conn->cm_channel = NULL;
+	}
+
 	free(conn);
+}
+
+static void go_rdma_free_listener(go_rdma_listener *listener) {
+	if (listener == NULL) {
+		return;
+	}
+
+	if (listener->listen_id != NULL) {
+		rdma_destroy_ep(listener->listen_id);
+		listener->listen_id = NULL;
+	}
+
+	free(listener);
 }
 
 static int go_rdma_open(
@@ -123,6 +352,7 @@ static int go_rdma_open(
 	uint32_t send_wr,
 	uint32_t recv_wr,
 	uint32_t inline_threshold,
+	int timeout_ms,
 	go_rdma_conn **out,
 	char **err_out
 ) {
@@ -145,7 +375,10 @@ static int go_rdma_open(
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_port_space = RDMA_PS_TCP;
 	hints.ai_qp_type = IBV_QPT_RC;
-	hints.ai_flags = RAI_NUMERICSERV;
+	hints.ai_flags = 0;
+#ifdef RAI_NUMERICSERV
+	hints.ai_flags |= RAI_NUMERICSERV;
+#endif
 
 	struct rdma_addrinfo *res = NULL;
 	int rc = rdma_getaddrinfo(host, port, &hints, &res);
@@ -170,6 +403,9 @@ static int go_rdma_open(
 		go_rdma_set_errno(err_out, "rdma_create_ep");
 		return errno != 0 ? errno : EIO;
 	}
+
+	int reuse_addr = 1;
+	(void)rdma_set_option(id, RDMA_OPTION_ID, RDMA_OPTION_ID_REUSEADDR, &reuse_addr, sizeof(reuse_addr));
 
 	go_rdma_conn *conn = (go_rdma_conn *)calloc(1, sizeof(go_rdma_conn));
 	if (conn == NULL) {
@@ -248,8 +484,200 @@ static int go_rdma_open(
 		return errno != 0 ? errno : EIO;
 	}
 
-	if (conn->id->qp != NULL) {
-		conn->inline_threshold = conn->id->qp->qp_cap.max_inline_data;
+	*out = conn;
+	return 0;
+}
+
+static int go_rdma_listen(
+	const char *host,
+	const char *port,
+	uint32_t frame_cap,
+	uint32_t send_wr,
+	uint32_t recv_wr,
+	uint32_t inline_threshold,
+	int backlog,
+	go_rdma_listener **out,
+	char **err_out
+) {
+	if (out == NULL) {
+		go_rdma_set_err(err_out, "go_rdma_listen: out is nil");
+		return EINVAL;
+	}
+	*out = NULL;
+
+	if (frame_cap <= GO_RDMA_FRAME_HEADER_SIZE) {
+		go_rdma_set_err(err_out, "go_rdma_listen: invalid frame_cap=%u", frame_cap);
+		return EINVAL;
+	}
+	if (send_wr == 0 || recv_wr == 0) {
+		go_rdma_set_err(err_out, "go_rdma_listen: queue depth must be > 0");
+		return EINVAL;
+	}
+	if (backlog <= 0) {
+		go_rdma_set_err(err_out, "go_rdma_listen: backlog must be > 0");
+		return EINVAL;
+	}
+
+	struct rdma_addrinfo hints;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_port_space = RDMA_PS_TCP;
+	hints.ai_qp_type = IBV_QPT_RC;
+
+	int flags = 0;
+#ifdef RAI_PASSIVE
+	flags |= RAI_PASSIVE;
+#endif
+#ifdef RAI_NUMERICSERV
+	flags |= RAI_NUMERICSERV;
+#endif
+	hints.ai_flags = flags;
+
+	struct rdma_addrinfo *res = NULL;
+	int rc = rdma_getaddrinfo(host, port, &hints, &res);
+	if (rc != 0) {
+		go_rdma_set_err(err_out, "rdma_getaddrinfo(listen): %s", gai_strerror(rc));
+		return rc > 0 ? rc : EINVAL;
+	}
+
+	struct ibv_qp_init_attr qp_attr;
+	memset(&qp_attr, 0, sizeof(qp_attr));
+	qp_attr.qp_type = IBV_QPT_RC;
+	qp_attr.cap.max_send_wr = send_wr;
+	qp_attr.cap.max_recv_wr = recv_wr;
+	qp_attr.cap.max_send_sge = 1;
+	qp_attr.cap.max_recv_sge = 1;
+	qp_attr.cap.max_inline_data = inline_threshold;
+
+	struct rdma_cm_id *listen_id = NULL;
+	rc = rdma_create_ep(&listen_id, res, NULL, &qp_attr);
+	rdma_freeaddrinfo(res);
+	if (rc != 0) {
+		go_rdma_set_errno(err_out, "rdma_create_ep(listen)");
+		return errno != 0 ? errno : EIO;
+	}
+
+	rc = rdma_listen(listen_id, backlog);
+	if (rc != 0) {
+		go_rdma_set_errno(err_out, "rdma_listen");
+		rdma_destroy_ep(listen_id);
+		return errno != 0 ? errno : EIO;
+	}
+
+	go_rdma_listener *listener = (go_rdma_listener *)calloc(1, sizeof(go_rdma_listener));
+	if (listener == NULL) {
+		go_rdma_set_errno(err_out, "calloc go_rdma_listener");
+		rdma_destroy_ep(listen_id);
+		return errno != 0 ? errno : ENOMEM;
+	}
+
+	listener->listen_id = listen_id;
+	listener->frame_cap = frame_cap;
+	listener->send_wr = send_wr;
+	listener->recv_wr = recv_wr;
+	listener->inline_threshold = inline_threshold;
+
+	*out = listener;
+	return 0;
+}
+
+static int go_rdma_accept(
+	go_rdma_listener *listener,
+	go_rdma_conn **out,
+	char **err_out
+) {
+	if (out == NULL) {
+		go_rdma_set_err(err_out, "go_rdma_accept: out is nil");
+		return EINVAL;
+	}
+	*out = NULL;
+
+	if (listener == NULL || listener->listen_id == NULL) {
+		go_rdma_set_err(err_out, "go_rdma_accept: listener closed");
+		return EBADF;
+	}
+
+	struct rdma_cm_id *id = NULL;
+	int rc = rdma_get_request(listener->listen_id, &id);
+	if (rc != 0) {
+		go_rdma_set_errno(err_out, "rdma_get_request");
+		return errno != 0 ? errno : EIO;
+	}
+
+	go_rdma_conn *conn = (go_rdma_conn *)calloc(1, sizeof(go_rdma_conn));
+	if (conn == NULL) {
+		go_rdma_set_errno(err_out, "calloc go_rdma_conn(accept)");
+		rdma_destroy_ep(id);
+		return errno != 0 ? errno : ENOMEM;
+	}
+
+	conn->id = id;
+	conn->frame_cap = listener->frame_cap;
+	conn->recv_depth = listener->recv_wr;
+	conn->inline_threshold = listener->inline_threshold;
+	conn->has_last_recv_slot = 0;
+
+	conn->send_buf = (uint8_t *)malloc(listener->frame_cap);
+	if (conn->send_buf == NULL) {
+		go_rdma_set_errno(err_out, "malloc send buffer(accept)");
+		go_rdma_free_conn(conn);
+		return errno != 0 ? errno : ENOMEM;
+	}
+
+	conn->send_mr = rdma_reg_msgs(conn->id, conn->send_buf, listener->frame_cap);
+	if (conn->send_mr == NULL) {
+		go_rdma_set_errno(err_out, "rdma_reg_msgs send(accept)");
+		go_rdma_free_conn(conn);
+		return errno != 0 ? errno : EIO;
+	}
+
+	conn->recv_slots = (go_rdma_recv_slot *)calloc(listener->recv_wr, sizeof(go_rdma_recv_slot));
+	if (conn->recv_slots == NULL) {
+		go_rdma_set_errno(err_out, "calloc recv slots(accept)");
+		go_rdma_free_conn(conn);
+		return errno != 0 ? errno : ENOMEM;
+	}
+
+	for (uint32_t i = 0; i < listener->recv_wr; i++) {
+		conn->recv_slots[i].buf = (uint8_t *)malloc(listener->frame_cap);
+		if (conn->recv_slots[i].buf == NULL) {
+			go_rdma_set_errno(err_out, "malloc recv buffer(accept)");
+			go_rdma_free_conn(conn);
+			return errno != 0 ? errno : ENOMEM;
+		}
+
+		conn->recv_slots[i].mr = rdma_reg_msgs(conn->id, conn->recv_slots[i].buf, listener->frame_cap);
+		if (conn->recv_slots[i].mr == NULL) {
+			go_rdma_set_errno(err_out, "rdma_reg_msgs recv(accept)");
+			go_rdma_free_conn(conn);
+			return errno != 0 ? errno : EIO;
+		}
+
+		rc = rdma_post_recv(
+			conn->id,
+			(void *)(uintptr_t)(i + 1),
+			conn->recv_slots[i].buf,
+			listener->frame_cap,
+			conn->recv_slots[i].mr
+		);
+		if (rc != 0) {
+			go_rdma_set_errno(err_out, "rdma_post_recv(accept)");
+			go_rdma_free_conn(conn);
+			return errno != 0 ? errno : EIO;
+		}
+	}
+
+	struct rdma_conn_param conn_param;
+	memset(&conn_param, 0, sizeof(conn_param));
+	conn_param.responder_resources = 1;
+	conn_param.initiator_depth = 1;
+	conn_param.retry_count = 7;
+	conn_param.rnr_retry_count = 7;
+
+	rc = rdma_accept(conn->id, &conn_param);
+	if (rc != 0) {
+		go_rdma_set_errno(err_out, "rdma_accept");
+		go_rdma_free_conn(conn);
+		return errno != 0 ? errno : EIO;
 	}
 
 	*out = conn;
@@ -262,6 +690,7 @@ static int go_rdma_send_frame(
 	uint32_t payload_len,
 	uint32_t total_len,
 	uint32_t offset,
+	int timeout_ms,
 	char **err_out
 ) {
 	if (conn == NULL || conn->id == NULL) {
@@ -307,15 +736,11 @@ static int go_rdma_send_frame(
 		return errno != 0 ? errno : EIO;
 	}
 
+	struct ibv_cq *send_cq = go_rdma_send_cq(conn);
 	struct ibv_wc wc;
-	rc = rdma_get_send_comp(conn->id, &wc);
-	if (rc <= 0) {
-		if (rc == 0) {
-			go_rdma_set_err(err_out, "rdma_get_send_comp: no completion");
-			return EIO;
-		}
-		go_rdma_set_errno(err_out, "rdma_get_send_comp");
-		return errno != 0 ? errno : EIO;
+	rc = go_rdma_poll_cq_with_timeout(send_cq, &wc, timeout_ms, "ibv_poll_cq(send)", err_out);
+	if (rc != 0) {
+		return rc;
 	}
 	if (wc.status != IBV_WC_SUCCESS) {
 		go_rdma_set_err(err_out, "rdma send completion failed: %s", ibv_wc_status_str(wc.status));
@@ -331,6 +756,7 @@ static int go_rdma_recv_frame(
 	uint32_t *payload_len,
 	uint32_t *total_len,
 	uint32_t *offset,
+	int timeout_ms,
 	char **err_out
 ) {
 	if (conn == NULL || conn->id == NULL) {
@@ -342,15 +768,11 @@ static int go_rdma_recv_frame(
 		return EINVAL;
 	}
 
+	struct ibv_cq *recv_cq = go_rdma_recv_cq(conn);
 	struct ibv_wc wc;
-	int rc = rdma_get_recv_comp(conn->id, &wc);
-	if (rc <= 0) {
-		if (rc == 0) {
-			go_rdma_set_err(err_out, "rdma_get_recv_comp: no completion");
-			return EIO;
-		}
-		go_rdma_set_errno(err_out, "rdma_get_recv_comp");
-		return errno != 0 ? errno : EIO;
+	int rc = go_rdma_poll_cq_with_timeout(recv_cq, &wc, timeout_ms, "ibv_poll_cq(recv)", err_out);
+	if (rc != 0) {
+		return rc;
 	}
 	if (wc.status != IBV_WC_SUCCESS) {
 		go_rdma_set_err(err_out, "rdma recv completion failed: %s", ibv_wc_status_str(wc.status));
@@ -426,6 +848,10 @@ static int go_rdma_repost_recv(go_rdma_conn *conn, char **err_out) {
 static void go_rdma_close(go_rdma_conn *conn) {
 	go_rdma_free_conn(conn);
 }
+
+static void go_rdma_listener_close(go_rdma_listener *listener) {
+	go_rdma_free_listener(listener);
+}
 */
 import "C"
 
@@ -435,13 +861,18 @@ import (
 	"fmt"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
+	"time"
 	"unsafe"
 )
 
 const (
-	verbsBackendEnabled  = true
-	verbsFrameHeaderSize = 12
+	verbsBackendEnabled   = true
+	verbsFrameHeaderSize  = 12
+	verbsOpenTimeoutMills = 3000
+	verbsOpenRetryBackoff = 250 * time.Millisecond
+	verbsOpenAttemptLimit = 8
 )
 
 type verbsMessageConn struct {
@@ -454,6 +885,172 @@ type verbsMessageConn struct {
 }
 
 var _ MessageConn = (*verbsMessageConn)(nil)
+
+type verbsListener struct {
+	mu sync.RWMutex
+	cl *C.go_rdma_listener
+
+	framePayloadSize int
+	localAddr        net.Addr
+}
+
+var _ net.Listener = (*verbsListener)(nil)
+
+func newVerbsListener(network, address string, opts VerbsListenerOptions) (net.Listener, error) {
+	cfg, err := opts.VerbsOptions.normalize()
+	if err != nil {
+		return nil, err
+	}
+
+	host, port, err := splitHostPortListenAddress(network, address)
+	if err != nil {
+		return nil, err
+	}
+
+	frameCap := cfg.framePayloadSize + verbsFrameHeaderSize
+	if frameCap <= verbsFrameHeaderSize {
+		return nil, fmt.Errorf("rdma verbs: invalid frame capacity")
+	}
+
+	backlog := opts.Backlog
+	if backlog == 0 {
+		backlog = DefaultVerbsListenBacklog
+	}
+	if backlog < 0 {
+		return nil, fmt.Errorf("rdma verbs: listen backlog must be >= 0")
+	}
+
+	var cHost *C.char
+	if host != "" {
+		cHost = C.CString(host)
+		defer C.free(unsafe.Pointer(cHost))
+	}
+	cPort := C.CString(port)
+	defer C.free(unsafe.Pointer(cPort))
+
+	var cListener *C.go_rdma_listener
+	var cErr *C.char
+	rc := C.go_rdma_listen(
+		cHost,
+		cPort,
+		C.uint32_t(frameCap),
+		C.uint32_t(cfg.sendQueueDepth),
+		C.uint32_t(cfg.recvQueueDepth),
+		C.uint32_t(cfg.inlineThreshold),
+		C.int(backlog),
+		&cListener,
+		&cErr,
+	)
+	if rc != 0 {
+		return nil, rdmaCError("listen", rc, cErr)
+	}
+	if cListener == nil {
+		return nil, errors.New("rdma verbs listen returned nil listener")
+	}
+
+	localHost := host
+	if localHost == "" {
+		localHost = "0.0.0.0"
+	}
+
+	return &verbsListener{
+		cl:               cListener,
+		framePayloadSize: cfg.framePayloadSize,
+		localAddr:        rdmaAddr{network: "rdma", address: net.JoinHostPort(localHost, port)},
+	}, nil
+}
+
+func splitHostPortListenAddress(network, address string) (host string, port string, err error) {
+	switch network {
+	case "", "tcp", "tcp4", "tcp6", "rdma", "rdma4", "rdma6":
+	default:
+		return "", "", fmt.Errorf("rdma verbs: unsupported network %q", network)
+	}
+
+	host, port, err = net.SplitHostPort(address)
+	if err != nil {
+		return "", "", fmt.Errorf("rdma verbs: invalid listen address %q: %w", address, err)
+	}
+	if port == "" {
+		return "", "", fmt.Errorf("rdma verbs: missing port in listen address %q", address)
+	}
+	return host, port, nil
+}
+
+func (l *verbsListener) Accept() (net.Conn, error) {
+	l.mu.RLock()
+	cListener := l.cl
+	framePayloadSize := l.framePayloadSize
+	localAddr := l.localAddr
+	l.mu.RUnlock()
+	if cListener == nil {
+		return nil, net.ErrClosed
+	}
+
+	var cConn *C.go_rdma_conn
+	var cErr *C.char
+	rc := C.go_rdma_accept(cListener, &cConn, &cErr)
+	if rc != 0 {
+		err := rdmaCError("accept", rc, cErr)
+		l.mu.RLock()
+		closed := l.cl == nil
+		l.mu.RUnlock()
+		if closed {
+			return nil, net.ErrClosed
+		}
+		if strings.Contains(err.Error(), "Invalid argument") {
+			return nil, temporaryListenerError{err: err}
+		}
+		return nil, err
+	}
+	if cConn == nil {
+		return nil, errors.New("rdma verbs accept returned nil connection")
+	}
+
+	msgConn := &verbsMessageConn{
+		cc:               cConn,
+		framePayloadSize: framePayloadSize,
+		localAddr:        localAddr,
+		remoteAddr:       rdmaAddr{network: "rdma", address: "remote"},
+	}
+	return NewConn(msgConn), nil
+}
+
+func (l *verbsListener) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.cl == nil {
+		return nil
+	}
+	C.go_rdma_listener_close(l.cl)
+	l.cl = nil
+	return nil
+}
+
+func (l *verbsListener) Addr() net.Addr {
+	return l.localAddr
+}
+
+type temporaryListenerError struct {
+	err error
+}
+
+func (e temporaryListenerError) Error() string {
+	return e.err.Error()
+}
+
+func (e temporaryListenerError) Unwrap() error {
+	return e.err
+}
+
+func (e temporaryListenerError) Timeout() bool {
+	return false
+}
+
+func (e temporaryListenerError) Temporary() bool {
+	return true
+}
 
 // Open opens a MessageConn backed by librdmacm + libibverbs.
 //
@@ -482,36 +1079,147 @@ func (o VerbsOptions) Open(ctx context.Context, network, address string) (Messag
 		return nil, fmt.Errorf("rdma verbs: invalid frame capacity")
 	}
 
-	cHost := C.CString(host)
-	defer C.free(unsafe.Pointer(cHost))
-	cPort := C.CString(port)
-	defer C.free(unsafe.Pointer(cPort))
+	deadline, hasDeadline := ctx.Deadline()
+	var lastErr error
+	attempt := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return nil, fmt.Errorf("rdma open canceled after %d attempts: %w (last open err: %v)", attempt, err, lastErr)
+			}
+			return nil, err
+		}
 
-	var cConn *C.go_rdma_conn
-	var cErr *C.char
-	rc := C.go_rdma_open(
-		cHost,
-		cPort,
-		C.uint32_t(frameCap),
-		C.uint32_t(cfg.sendQueueDepth),
-		C.uint32_t(cfg.recvQueueDepth),
-		C.uint32_t(cfg.inlineThreshold),
-		&cConn,
-		&cErr,
-	)
-	if rc != 0 {
-		return nil, rdmaCError("open", rc, cErr)
+		if !hasDeadline && attempt >= verbsOpenAttemptLimit {
+			if lastErr != nil {
+				return nil, fmt.Errorf("rdma open failed after %d attempts: %w", attempt, lastErr)
+			}
+			return nil, errors.New("rdma open failed")
+		}
+
+		attemptTimeout := 3 * time.Second
+		if hasDeadline {
+			remain := time.Until(deadline)
+			if remain <= 0 {
+				if lastErr != nil {
+					return nil, fmt.Errorf("rdma open deadline exceeded after %d attempts: %w", attempt, lastErr)
+				}
+				return nil, context.DeadlineExceeded
+			}
+			if remain < attemptTimeout {
+				attemptTimeout = remain
+			}
+		}
+
+		attemptCtx, cancelAttempt := context.WithTimeout(ctx, attemptTimeout)
+		cConn, openErr := openVerbsConnOnce(attemptCtx, host, port, frameCap, cfg)
+		cancelAttempt()
+		attempt++
+		if openErr == nil {
+			return &verbsMessageConn{
+				cc:               cConn,
+				framePayloadSize: cfg.framePayloadSize,
+				localAddr:        rdmaAddr{network: "rdma", address: "local"},
+				remoteAddr:       rdmaAddr{network: "rdma", address: net.JoinHostPort(host, port)},
+			}, nil
+		}
+
+		lastErr = openErr
+		if !isRetriableOpenErr(openErr) {
+			return nil, openErr
+		}
+
+		if hasDeadline {
+			remain := time.Until(deadline)
+			if remain <= 0 {
+				return nil, fmt.Errorf("rdma open deadline exceeded after %d attempts: %w", attempt, lastErr)
+			}
+			sleep := verbsOpenRetryBackoff
+			if remain < sleep {
+				sleep = remain
+			}
+			timer := time.NewTimer(sleep)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+			continue
+		}
+
+		time.Sleep(verbsOpenRetryBackoff)
 	}
-	if cConn == nil {
+}
+
+type openResult struct {
+	cConn *C.go_rdma_conn
+	cErr  *C.char
+	rc    C.int
+}
+
+func openVerbsConnOnce(ctx context.Context, host, port string, frameCap int, cfg verbsConfig) (*C.go_rdma_conn, error) {
+	openTimeoutMS, err := rdmaOpenTimeoutMillis(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	resultCh := make(chan openResult, 1)
+	go func() {
+		cHost := C.CString(host)
+		defer C.free(unsafe.Pointer(cHost))
+		cPort := C.CString(port)
+		defer C.free(unsafe.Pointer(cPort))
+
+		var result openResult
+		result.rc = C.go_rdma_open(
+			cHost,
+			cPort,
+			C.uint32_t(frameCap),
+			C.uint32_t(cfg.sendQueueDepth),
+			C.uint32_t(cfg.recvQueueDepth),
+			C.uint32_t(cfg.inlineThreshold),
+			openTimeoutMS,
+			&result.cConn,
+			&result.cErr,
+		)
+		resultCh <- result
+	}()
+
+	var result openResult
+	select {
+	case <-ctx.Done():
+		go func() {
+			late := <-resultCh
+			if late.cConn != nil {
+				C.go_rdma_close(late.cConn)
+			}
+			if late.cErr != nil {
+				C.free(unsafe.Pointer(late.cErr))
+			}
+		}()
+		return nil, ctx.Err()
+	case result = <-resultCh:
+	}
+
+	if result.rc != 0 {
+		return nil, rdmaCError("open", result.rc, result.cErr)
+	}
+	if result.cConn == nil {
 		return nil, errors.New("rdma verbs open returned nil connection")
 	}
+	return result.cConn, nil
+}
 
-	return &verbsMessageConn{
-		cc:               cConn,
-		framePayloadSize: cfg.framePayloadSize,
-		localAddr:        rdmaAddr{network: "rdma", address: "local"},
-		remoteAddr:       rdmaAddr{network: "rdma", address: net.JoinHostPort(host, port)},
-	}, nil
+func isRetriableOpenErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "rdma verbs open")
 }
 
 func (c *verbsMessageConn) SendMessage(ctx context.Context, payload []byte) error {
@@ -527,7 +1235,7 @@ func (c *verbsMessageConn) SendMessage(ctx context.Context, payload []byte) erro
 
 	total := len(payload)
 	if total == 0 {
-		return c.sendFrame(nil, 0, 0)
+		return c.sendFrame(ctx, nil, 0, 0)
 	}
 
 	for offset := 0; offset < total; offset += c.framePayloadSize {
@@ -542,7 +1250,7 @@ func (c *verbsMessageConn) SendMessage(ctx context.Context, payload []byte) erro
 		}
 
 		chunk := payload[offset : offset+chunkLen]
-		if err := c.sendFrame(chunk, total, offset); err != nil {
+		if err := c.sendFrame(ctx, chunk, total, offset); err != nil {
 			return err
 		}
 	}
@@ -550,7 +1258,12 @@ func (c *verbsMessageConn) SendMessage(ctx context.Context, payload []byte) erro
 	return nil
 }
 
-func (c *verbsMessageConn) sendFrame(chunk []byte, totalLen int, offset int) error {
+func (c *verbsMessageConn) sendFrame(ctx context.Context, chunk []byte, totalLen int, offset int) error {
+	timeoutMS, err := rdmaContextTimeoutMillis(ctx)
+	if err != nil {
+		return err
+	}
+
 	var payloadPtr *C.uint8_t
 	if len(chunk) > 0 {
 		payloadPtr = (*C.uint8_t)(unsafe.Pointer(&chunk[0]))
@@ -563,10 +1276,17 @@ func (c *verbsMessageConn) sendFrame(chunk []byte, totalLen int, offset int) err
 		C.uint32_t(len(chunk)),
 		C.uint32_t(totalLen),
 		C.uint32_t(offset),
+		timeoutMS,
 		&cErr,
 	)
 	runtime.KeepAlive(chunk)
 	if rc != 0 {
+		if rc == C.int(C.EAGAIN) {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return context.DeadlineExceeded
+		}
 		return rdmaCError("send", rc, cErr)
 	}
 	return nil
@@ -599,9 +1319,19 @@ func (c *verbsMessageConn) RecvMessage(ctx context.Context) ([]byte, error) {
 			frameOff   C.uint32_t
 			cErr       *C.char
 		)
+		timeoutMS, err := rdmaContextTimeoutMillis(ctx)
+		if err != nil {
+			return nil, err
+		}
 
-		rc := C.go_rdma_recv_frame(c.cc, &payloadPtr, &payloadLen, &frameTotal, &frameOff, &cErr)
+		rc := C.go_rdma_recv_frame(c.cc, &payloadPtr, &payloadLen, &frameTotal, &frameOff, timeoutMS, &cErr)
 		if rc != 0 {
+			if rc == C.int(C.EAGAIN) {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			return nil, rdmaCError("recv", rc, cErr)
 		}
 
@@ -672,6 +1402,43 @@ func (c *verbsMessageConn) LocalAddr() net.Addr {
 
 func (c *verbsMessageConn) RemoteAddr() net.Addr {
 	return c.remoteAddr
+}
+
+func rdmaContextTimeoutMillis(ctx context.Context) (C.int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return C.int(-1), nil
+	}
+
+	remain := time.Until(deadline)
+	if remain <= 0 {
+		return 0, context.DeadlineExceeded
+	}
+
+	ms := int64(remain / time.Millisecond)
+	if remain%time.Millisecond != 0 {
+		ms++
+	}
+	if ms > 2147483647 {
+		ms = 2147483647
+	}
+
+	return C.int(ms), nil
+}
+
+func rdmaOpenTimeoutMillis(ctx context.Context) (C.int, error) {
+	timeoutMS, err := rdmaContextTimeoutMillis(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if timeoutMS >= 0 {
+		return timeoutMS, nil
+	}
+	return C.int(verbsOpenTimeoutMills), nil
 }
 
 func rdmaCError(op string, rc C.int, cErr *C.char) error {

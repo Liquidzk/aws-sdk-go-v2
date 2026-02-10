@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -130,6 +131,41 @@ func TestConnReadDeadline(t *testing.T) {
 	}
 }
 
+func TestConnReadDeadlineInterruptsInFlightRead(t *testing.T) {
+	var recvCalls int32
+	c := NewConn(&mockMessageConn{
+		recvFn: func(ctx context.Context) ([]byte, error) {
+			atomic.AddInt32(&recvCalls, 1)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Read(make([]byte, 1))
+		done <- err
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	if err := c.SetReadDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+		t.Fatalf("set read deadline failed: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("expected deadline exceeded, got %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("read did not unblock after setting read deadline")
+	}
+
+	if atomic.LoadInt32(&recvCalls) == 0 {
+		t.Fatalf("expected recv to be called at least once")
+	}
+}
+
 func TestConnWriteDeadline(t *testing.T) {
 	c := NewConn(&mockMessageConn{
 		sendFn: func(ctx context.Context, payload []byte) error {
@@ -145,6 +181,28 @@ func TestConnWriteDeadline(t *testing.T) {
 	_, err := c.Write([]byte("x"))
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+}
+
+func TestConnWriteUsesDefaultTimeoutWhenNoDeadline(t *testing.T) {
+	old := defaultWriteTimeout
+	defaultWriteTimeout = 30 * time.Millisecond
+	defer func() { defaultWriteTimeout = old }()
+
+	c := NewConn(&mockMessageConn{
+		sendFn: func(ctx context.Context, payload []byte) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+
+	start := time.Now()
+	_, err := c.Write([]byte("x"))
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+	if took := time.Since(start); took > 500*time.Millisecond {
+		t.Fatalf("write took too long: %s", took)
 	}
 }
 
@@ -241,6 +299,90 @@ func TestDialerNilMessageConn(t *testing.T) {
 	_, err := d.DialContext(context.Background(), "tcp", "127.0.0.1:1")
 	if err == nil {
 		t.Fatalf("expected error for nil message conn")
+	}
+}
+
+func TestDialerOpenParallelismLimit(t *testing.T) {
+	var active int32
+	var maxActive int32
+
+	d := NewVerbsDialer(VerbsOptions{})
+	d.Open = func(ctx context.Context, network, address string) (MessageConn, error) {
+		cur := atomic.AddInt32(&active, 1)
+		for {
+			prev := atomic.LoadInt32(&maxActive)
+			if cur <= prev || atomic.CompareAndSwapInt32(&maxActive, prev, cur) {
+				break
+			}
+		}
+		time.Sleep(30 * time.Millisecond)
+		atomic.AddInt32(&active, -1)
+		return &mockMessageConn{}, nil
+	}
+	d.OpenParallelism = 1
+	d.OpenMinInterval = 0
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 6)
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := d.DialContext(context.Background(), "tcp", "example:1")
+			if err != nil {
+				errCh <- err
+				return
+			}
+			_ = conn.Close()
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+	}
+
+	if got := atomic.LoadInt32(&maxActive); got > 1 {
+		t.Fatalf("expected max concurrent open <= 1, got %d", got)
+	}
+}
+
+func TestDialerOpenMinInterval(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		times []time.Time
+	)
+
+	d := NewVerbsDialer(VerbsOptions{})
+	d.Open = func(ctx context.Context, network, address string) (MessageConn, error) {
+		mu.Lock()
+		times = append(times, time.Now())
+		mu.Unlock()
+		return &mockMessageConn{}, nil
+	}
+	d.OpenParallelism = 1
+	d.OpenMinInterval = 40 * time.Millisecond
+
+	for i := 0; i < 2; i++ {
+		conn, err := d.DialContext(context.Background(), "tcp", "example:1")
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		_ = conn.Close()
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(times) != 2 {
+		t.Fatalf("expected 2 open calls, got %d", len(times))
+	}
+
+	gap := times[1].Sub(times[0])
+	if gap < 30*time.Millisecond {
+		t.Fatalf("expected open interval >= 30ms, got %s", gap)
 	}
 }
 

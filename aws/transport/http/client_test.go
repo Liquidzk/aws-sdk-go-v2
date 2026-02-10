@@ -3,9 +3,11 @@ package http
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,6 +15,22 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 )
+
+type closeIdleCounterTransport struct {
+	closed int32
+}
+
+func (t *closeIdleCounterTransport) RoundTrip(_ *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("ok")),
+	}, nil
+}
+
+func (t *closeIdleCounterTransport) CloseIdleConnections() {
+	atomic.AddInt32(&t.closed, 1)
+}
 
 func TestBuildableClient_NoFollowRedirect(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(
@@ -182,4 +200,26 @@ func TestBuildableClient_concurrent(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestSuppressBadHTTPRedirectTransport_CloseIdleConnections(t *testing.T) {
+	base := &closeIdleCounterTransport{}
+	wrapped := suppressBadHTTPRedirectTransport{tr: base}
+
+	wrapped.CloseIdleConnections()
+	if got := atomic.LoadInt32(&base.closed); got != 1 {
+		t.Fatalf("expected CloseIdleConnections to be forwarded once, got %d", got)
+	}
+}
+
+func TestBuildableClient_CloseIdleConnections(t *testing.T) {
+	base := &closeIdleCounterTransport{}
+	client := NewBuildableClient()
+	client.build()
+	client.client.Transport = suppressBadHTTPRedirectTransport{tr: base}
+
+	client.CloseIdleConnections()
+	if got := atomic.LoadInt32(&base.closed); got != 1 {
+		t.Fatalf("expected BuildableClient.CloseIdleConnections to close transport, got %d", got)
+	}
 }

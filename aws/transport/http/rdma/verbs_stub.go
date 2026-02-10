@@ -5,6 +5,7 @@ package rdma
 import (
 	"context"
 	"fmt"
+	"net"
 )
 
 const verbsBackendEnabled = false
@@ -17,5 +18,10 @@ func (o VerbsOptions) Open(ctx context.Context, network, address string) (Messag
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	return nil, fmt.Errorf("rdma verbs backend unavailable; rebuild with -tags rdma and CGO_ENABLED=1")
+}
+
+func newVerbsListener(network, address string, opts VerbsListenerOptions) (net.Listener, error) {
+	_, _, _ = network, address, opts
 	return nil, fmt.Errorf("rdma verbs backend unavailable; rebuild with -tags rdma and CGO_ENABLED=1")
 }

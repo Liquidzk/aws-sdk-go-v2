@@ -9,6 +9,16 @@ import (
 	"time"
 )
 
+var (
+	// readPollInterval bounds how long one RecvMessage call can block so
+	// SetReadDeadline can interrupt in-flight reads.
+	readPollInterval = 50 * time.Millisecond
+
+	// defaultWriteTimeout bounds write-side stalls when net/http does not set
+	// a write deadline for the connection.
+	defaultWriteTimeout = 5 * time.Second
+)
+
 // MessageConn models an ordered, reliable message channel that can be adapted
 // into a byte-stream net.Conn.
 //
@@ -91,7 +101,12 @@ func (c *Conn) Write(p []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	ctx, cancel := c.contextWithDeadline(c.getWriteDeadline())
+	writeDeadline := c.getWriteDeadline()
+	if writeDeadline.IsZero() {
+		writeDeadline = time.Now().Add(defaultWriteTimeout)
+	}
+
+	ctx, cancel := c.contextWithDeadline(writeDeadline)
 	defer cancel()
 
 	if err := c.stream.SendMessage(ctx, p); err != nil {
@@ -153,15 +168,25 @@ func (c *Conn) recvWithDeadline() ([]byte, error) {
 		return nil, net.ErrClosed
 	}
 
-	ctx, cancel := c.contextWithDeadline(c.getReadDeadline())
-	defer cancel()
+	for {
+		deadline := c.getReadDeadline()
+		ctx, cancel := c.contextWithReadSlice(deadline)
+		msg, err := c.stream.RecvMessage(ctx)
+		cancel()
+		if err == nil {
+			return msg, nil
+		}
 
-	msg, err := c.stream.RecvMessage(ctx)
-	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			if !deadline.IsZero() && !time.Now().Before(deadline) {
+				return nil, os.ErrDeadlineExceeded
+			}
+			// Re-check deadline and keep waiting.
+			continue
+		}
+
 		return nil, normalizeContextErr(err)
 	}
-
-	return msg, nil
 }
 
 func (c *Conn) getReadDeadline() time.Time {
@@ -179,6 +204,21 @@ func (c *Conn) getWriteDeadline() time.Time {
 func (c *Conn) contextWithDeadline(deadline time.Time) (context.Context, context.CancelFunc) {
 	if deadline.IsZero() {
 		return context.WithCancel(context.Background())
+	}
+	return context.WithDeadline(context.Background(), deadline)
+}
+
+func (c *Conn) contextWithReadSlice(deadline time.Time) (context.Context, context.CancelFunc) {
+	if deadline.IsZero() {
+		return context.WithTimeout(context.Background(), readPollInterval)
+	}
+
+	remain := time.Until(deadline)
+	if remain <= 0 {
+		return context.WithDeadline(context.Background(), deadline)
+	}
+	if remain > readPollInterval {
+		return context.WithTimeout(context.Background(), readPollInterval)
 	}
 	return context.WithDeadline(context.Background(), deadline)
 }

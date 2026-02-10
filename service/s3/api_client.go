@@ -236,6 +236,8 @@ func New(options Options, optFns ...func(*Options)) *Client {
 		fn(&options)
 	}
 
+	finalizeRDMATransportHTTPClient(&options)
+
 	finalizeRetryMaxAttempts(&options)
 
 	ignoreAnonymousAuth(&options)
@@ -557,6 +559,15 @@ func resolveRDMATransportDialer(o *Options, buildable *awshttp.BuildableClient) 
 	}
 
 	return buildable.WithDialContext(dialer.DialContext)
+}
+
+func finalizeRDMATransportHTTPClient(o *Options) {
+	buildable, ok := o.HTTPClient.(*awshttp.BuildableClient)
+	if !ok {
+		return
+	}
+
+	o.HTTPClient = resolveRDMATransportDialer(o, buildable)
 }
 
 func isRDMATransportEnabled(o *Options) bool {

@@ -74,6 +74,14 @@ func (b *BuildableClient) Do(req *http.Request) (*http.Response, error) {
 	return b.client.Do(req)
 }
 
+// CloseIdleConnections closes idle connections from the client's transport pool.
+func (b *BuildableClient) CloseIdleConnections() {
+	if b.client == nil {
+		return
+	}
+	b.client.CloseIdleConnections()
+}
+
 // Freeze returns a frozen aws.HTTPClient implementation that is no longer a BuildableClient.
 // Use this to prevent the SDK from applying DefaultMode configuration values to a buildable client.
 func (b *BuildableClient) Freeze() aws.HTTPClient {
@@ -367,4 +375,10 @@ func (t suppressBadHTTPRedirectTransport) RoundTrip(r *http.Request) (*http.Resp
 	}
 
 	return resp, err
+}
+
+func (t suppressBadHTTPRedirectTransport) CloseIdleConnections() {
+	if tr, ok := t.tr.(interface{ CloseIdleConnections() }); ok {
+		tr.CloseIdleConnections()
+	}
 }

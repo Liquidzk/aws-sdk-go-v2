@@ -11,13 +11,13 @@ const (
 	DefaultVerbsFramePayloadSize = 64 * 1024
 
 	// DefaultVerbsSendQueueDepth is the default send queue depth for RC QP.
-	DefaultVerbsSendQueueDepth = 256
+	DefaultVerbsSendQueueDepth = 64
 
 	// DefaultVerbsRecvQueueDepth is the default receive queue depth for RC QP.
-	DefaultVerbsRecvQueueDepth = 256
+	DefaultVerbsRecvQueueDepth = 64
 
 	// DefaultVerbsInlineThreshold is the default inline send threshold in bytes.
-	DefaultVerbsInlineThreshold = 256
+	DefaultVerbsInlineThreshold = 0
 )
 
 // VerbsOptions controls the RDMA verbs backend used by Dialer.Open.
@@ -39,7 +39,12 @@ type VerbsOptions struct {
 
 // NewVerbsDialer creates a Dialer that opens connections through RDMA verbs.
 func NewVerbsDialer(opts VerbsOptions) Dialer {
-	return Dialer{Open: opts.Open}
+	return Dialer{
+		Open:            opts.Open,
+		OpenParallelism: DefaultOpenParallelism,
+		OpenMinInterval: DefaultOpenMinInterval,
+		state:           &dialerState{},
+	}
 }
 
 type verbsConfig struct {
