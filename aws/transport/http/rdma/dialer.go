@@ -10,12 +10,13 @@ import (
 )
 
 const (
-	// DefaultOpenParallelism serializes RDMA open attempts by default.
-	// This reduces CM churn when callers issue bursts of new connections.
+	// DefaultOpenParallelism keeps a small amount of open concurrency by
+	// default, avoiding open storms while still allowing steady connection
+	// creation under load.
 	DefaultOpenParallelism = 1
 
-	// DefaultOpenMinInterval spaces RDMA open attempts to avoid reconnect storms.
-	DefaultOpenMinInterval = 200 * time.Millisecond
+	// DefaultOpenMinInterval keeps no extra spacing between RDMA open attempts.
+	DefaultOpenMinInterval = 0 * time.Millisecond
 )
 
 // OpenFunc opens a RDMA-like message connection to a remote address.

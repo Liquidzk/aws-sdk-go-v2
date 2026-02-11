@@ -18,6 +18,15 @@ const (
 
 	// DefaultVerbsInlineThreshold is the default inline send threshold in bytes.
 	DefaultVerbsInlineThreshold = 0
+
+	// DefaultVerbsSendSignalInterval requests completion for every frame.
+	// This minimizes latency but increases CQ/cpu overhead.
+	DefaultVerbsSendSignalInterval = 1
+
+	// DefaultVerbsLowCPUSendSignalInterval requests completion every N frames
+	// in low-cpu mode. This reduces completion handling overhead at the cost of
+	// higher completion latency.
+	DefaultVerbsLowCPUSendSignalInterval = 16
 )
 
 // VerbsOptions controls the RDMA verbs backend used by Dialer.Open.
@@ -35,6 +44,15 @@ type VerbsOptions struct {
 	// InlineThreshold enables IBV_SEND_INLINE when frame size is less than or
 	// equal to this value. A value of 0 uses DefaultVerbsInlineThreshold.
 	InlineThreshold int
+
+	// LowCPU prioritizes lower CPU usage over latency/throughput.
+	// When true and SendSignalInterval is 0, a larger completion interval is used.
+	LowCPU bool
+
+	// SendSignalInterval controls how often sends are signaled for CQ completion.
+	// 1 means every frame; larger values reduce completion overhead.
+	// A value of 0 uses defaults (depends on LowCPU).
+	SendSignalInterval int
 }
 
 // NewVerbsDialer creates a Dialer that opens connections through RDMA verbs.
@@ -52,6 +70,8 @@ type verbsConfig struct {
 	sendQueueDepth   int
 	recvQueueDepth   int
 	inlineThreshold  int
+	sendSignalIntvl  int
+	lowCPU           bool
 }
 
 func (o VerbsOptions) normalize() (verbsConfig, error) {
@@ -60,6 +80,8 @@ func (o VerbsOptions) normalize() (verbsConfig, error) {
 		sendQueueDepth:   DefaultVerbsSendQueueDepth,
 		recvQueueDepth:   DefaultVerbsRecvQueueDepth,
 		inlineThreshold:  DefaultVerbsInlineThreshold,
+		sendSignalIntvl:  DefaultVerbsSendSignalInterval,
+		lowCPU:           o.LowCPU,
 	}
 
 	if o.FramePayloadSize < 0 {
@@ -74,6 +96,9 @@ func (o VerbsOptions) normalize() (verbsConfig, error) {
 	if o.InlineThreshold < 0 {
 		return verbsConfig{}, fmt.Errorf("rdma verbs: inline threshold must be >= 0")
 	}
+	if o.SendSignalInterval < 0 {
+		return verbsConfig{}, fmt.Errorf("rdma verbs: send signal interval must be >= 0")
+	}
 
 	if o.FramePayloadSize > 0 {
 		cfg.framePayloadSize = o.FramePayloadSize
@@ -86,6 +111,12 @@ func (o VerbsOptions) normalize() (verbsConfig, error) {
 	}
 	if o.InlineThreshold > 0 {
 		cfg.inlineThreshold = o.InlineThreshold
+	}
+	if o.LowCPU {
+		cfg.sendSignalIntvl = DefaultVerbsLowCPUSendSignalInterval
+	}
+	if o.SendSignalInterval > 0 {
+		cfg.sendSignalIntvl = o.SendSignalInterval
 	}
 
 	return cfg, nil

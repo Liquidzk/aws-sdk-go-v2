@@ -24,6 +24,9 @@ func TestVerbsOptionsNormalizeDefaults(t *testing.T) {
 	if cfg.inlineThreshold != DefaultVerbsInlineThreshold {
 		t.Fatalf("inline threshold default = %d", cfg.inlineThreshold)
 	}
+	if cfg.sendSignalIntvl != DefaultVerbsSendSignalInterval {
+		t.Fatalf("send signal interval default = %d", cfg.sendSignalIntvl)
+	}
 }
 
 func TestVerbsOptionsNormalizeValidation(t *testing.T) {
@@ -32,12 +35,34 @@ func TestVerbsOptionsNormalizeValidation(t *testing.T) {
 		{SendQueueDepth: -1},
 		{RecvQueueDepth: -1},
 		{InlineThreshold: -2},
+		{SendSignalInterval: -1},
 	}
 
 	for i, tc := range cases {
 		if _, err := tc.normalize(); err == nil {
 			t.Fatalf("case %d expected validation error", i)
 		}
+	}
+}
+
+func TestVerbsOptionsNormalizeLowCPU(t *testing.T) {
+	cfg, err := (VerbsOptions{LowCPU: true}).normalize()
+	if err != nil {
+		t.Fatalf("normalize lowcpu failed: %v", err)
+	}
+	if cfg.sendSignalIntvl != DefaultVerbsLowCPUSendSignalInterval {
+		t.Fatalf("lowcpu send signal interval = %d", cfg.sendSignalIntvl)
+	}
+
+	cfg, err = (VerbsOptions{
+		LowCPU:             true,
+		SendSignalInterval: 7,
+	}).normalize()
+	if err != nil {
+		t.Fatalf("normalize lowcpu override failed: %v", err)
+	}
+	if cfg.sendSignalIntvl != 7 {
+		t.Fatalf("send signal interval override = %d", cfg.sendSignalIntvl)
 	}
 }
 
