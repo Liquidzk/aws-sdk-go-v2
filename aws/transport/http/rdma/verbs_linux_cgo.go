@@ -21,12 +21,9 @@ package rdma
 #include <time.h>
 
 enum {
-	GO_RDMA_FRAME_HEADER_SIZE = 12,
 	// Keep only a short spin window, then yield to event/low-frequency wait.
 	GO_RDMA_POLL_SPINS = 2,
 	GO_RDMA_POLL_SLEEP_US = 1000,
-	GO_RDMA_PEER_INFO_MAGIC = 0x52444D41, // "RDMA"
-	GO_RDMA_FLOW_WAIT_US = 1000,
 	// Bound server-side accept handshake so one bad peer does not stall Accept.
 	// Keep this reasonably large to tolerate connection bursts.
 	GO_RDMA_ACCEPT_HANDSHAKE_TIMEOUT_MS = 15000,
@@ -36,21 +33,6 @@ typedef struct {
 	uint8_t *buf;
 	struct ibv_mr *mr;
 } go_rdma_recv_slot;
-
-typedef struct {
-	uint32_t prod;
-	uint32_t cons;
-} go_rdma_ring_ctrl;
-
-typedef struct {
-	uint64_t rx_addr;
-	uint32_t rx_rkey;
-	uint64_t ctrl_addr;
-	uint32_t ctrl_rkey;
-	uint32_t depth;
-	uint32_t frame_cap;
-	uint32_t magic;
-} go_rdma_peer_info;
 
 typedef struct {
 	struct rdma_cm_id *id;
@@ -66,19 +48,6 @@ typedef struct {
 	uint32_t send_depth;
 	uint32_t send_completed;
 	uint32_t send_signal_interval;
-	uint8_t *rx_region;
-	struct ibv_mr *rx_mr;
-	go_rdma_ring_ctrl *local_ctrl;
-	struct ibv_mr *local_ctrl_mr;
-	uint32_t *remote_cons_buf;
-	struct ibv_mr *remote_cons_mr;
-	uint64_t remote_rx_addr;
-	uint32_t remote_rx_rkey;
-	uint64_t remote_ctrl_addr;
-	uint32_t remote_ctrl_rkey;
-	uint32_t remote_depth;
-	uint32_t remote_frame_cap;
-	uint32_t remote_cons_cache;
 	uint32_t tx_prod;
 	go_rdma_recv_slot *notify_slots;
 	uint32_t notify_depth;
@@ -380,16 +349,6 @@ static struct ibv_cq *go_rdma_recv_cq(go_rdma_conn *conn) {
 	return conn->id->recv_cq;
 }
 
-static struct ibv_pd *go_rdma_pd(go_rdma_conn *conn) {
-	if (conn == NULL || conn->id == NULL) {
-		return NULL;
-	}
-	if (conn->pd != NULL) {
-		return conn->pd;
-	}
-	return conn->id->pd;
-}
-
 static void go_rdma_free_conn(go_rdma_conn *conn) {
 	if (conn == NULL) {
 		return;
@@ -402,21 +361,6 @@ static void go_rdma_free_conn(go_rdma_conn *conn) {
 	if (conn->send_mr != NULL) {
 		rdma_dereg_mr(conn->send_mr);
 		conn->send_mr = NULL;
-	}
-
-	if (conn->rx_mr != NULL) {
-		rdma_dereg_mr(conn->rx_mr);
-		conn->rx_mr = NULL;
-	}
-
-	if (conn->local_ctrl_mr != NULL) {
-		rdma_dereg_mr(conn->local_ctrl_mr);
-		conn->local_ctrl_mr = NULL;
-	}
-
-	if (conn->remote_cons_mr != NULL) {
-		rdma_dereg_mr(conn->remote_cons_mr);
-		conn->remote_cons_mr = NULL;
 	}
 
 	if (conn->notify_slots != NULL) {
@@ -432,21 +376,6 @@ static void go_rdma_free_conn(go_rdma_conn *conn) {
 		}
 		free(conn->notify_slots);
 		conn->notify_slots = NULL;
-	}
-
-	if (conn->rx_region != NULL) {
-		free(conn->rx_region);
-		conn->rx_region = NULL;
-	}
-
-	if (conn->local_ctrl != NULL) {
-		free(conn->local_ctrl);
-		conn->local_ctrl = NULL;
-	}
-
-	if (conn->remote_cons_buf != NULL) {
-		free(conn->remote_cons_buf);
-		conn->remote_cons_buf = NULL;
 	}
 
 	if (conn->send_buf != NULL) {
@@ -511,7 +440,6 @@ static void go_rdma_free_listener(go_rdma_listener *listener) {
 	free(listener);
 }
 
-static int go_rdma_exchange_peer_info(go_rdma_conn *conn, int timeout_ms, char **err_out);
 static int go_rdma_ensure_ready(go_rdma_conn *conn, int timeout_ms, char **err_out);
 
 static int go_rdma_wait_send_completion_with_id(
@@ -535,10 +463,6 @@ static int go_rdma_wait_send_completion_with_id(
 		*wr_id_out = (uint64_t)wc.wr_id;
 	}
 	return 0;
-}
-
-static int go_rdma_wait_send_completion(go_rdma_conn *conn, int timeout_ms, const char *op, char **err_out) {
-	return go_rdma_wait_send_completion_with_id(conn, timeout_ms, op, NULL, err_out);
 }
 
 static int go_rdma_wait_recv_completion(go_rdma_conn *conn, int timeout_ms, const char *op, struct ibv_wc *wc_out, char **err_out) {
@@ -572,11 +496,6 @@ static int go_rdma_reap_data_send_completion(go_rdma_conn *conn, int timeout_ms,
 		}
 
 		uint32_t wr32 = (uint32_t)wr_id;
-		// Ignore control-plane completions that use reserved wr_id values.
-		if (wr32 >= 0xFFFFFFF0u) {
-			continue;
-		}
-
 		uint32_t done = wr32 + 1;
 		if ((int32_t)(done - conn->send_completed) > 0) {
 			conn->send_completed = done;
@@ -619,11 +538,11 @@ static int go_rdma_post_notify_recv_slot(go_rdma_conn *conn, uint32_t idx, char 
 		conn->id,
 		(void *)(uintptr_t)(idx + 1),
 		slot->buf,
-		1,
+		conn->frame_cap,
 		slot->mr
 	);
 	if (rc != 0) {
-		go_rdma_set_errno(err_out, "rdma_post_recv(notify)");
+		go_rdma_set_errno(err_out, "rdma_post_recv(recv_data)");
 		return errno != 0 ? errno : EIO;
 	}
 	return 0;
@@ -657,15 +576,19 @@ static int go_rdma_init_notify_slots(go_rdma_conn *conn, uint32_t depth, char **
 		return errno != 0 ? errno : ENOMEM;
 	}
 	conn->notify_depth = depth;
+	if (conn->frame_cap == 0) {
+		go_rdma_set_err(err_out, "go_rdma_init_notify_slots: frame_cap must be > 0");
+		return EINVAL;
+	}
 
 	for (uint32_t i = 0; i < depth; i++) {
-		conn->notify_slots[i].buf = (uint8_t *)malloc(1);
+		conn->notify_slots[i].buf = (uint8_t *)malloc(conn->frame_cap);
 		if (conn->notify_slots[i].buf == NULL) {
 			go_rdma_set_errno(err_out, "malloc notify recv buffer");
 			return errno != 0 ? errno : ENOMEM;
 		}
 
-		conn->notify_slots[i].mr = rdma_reg_msgs(conn->id, conn->notify_slots[i].buf, 1);
+		conn->notify_slots[i].mr = rdma_reg_msgs(conn->id, conn->notify_slots[i].buf, conn->frame_cap);
 		if (conn->notify_slots[i].mr == NULL) {
 			go_rdma_set_errno(err_out, "rdma_reg_msgs notify recv");
 			return errno != 0 ? errno : EIO;
@@ -686,12 +609,7 @@ static int go_rdma_ensure_ready(go_rdma_conn *conn, int timeout_ms, char **err_o
 		return EBADF;
 	}
 
-	if (conn->remote_depth == 0) {
-		int rc = go_rdma_exchange_peer_info(conn, timeout_ms, err_out);
-		if (rc != 0) {
-			return rc;
-		}
-	}
+	(void)timeout_ms;
 
 	if (conn->notify_slots == NULL) {
 		int rc = go_rdma_init_notify_slots(conn, conn->recv_depth, err_out);
@@ -701,247 +619,6 @@ static int go_rdma_ensure_ready(go_rdma_conn *conn, int timeout_ms, char **err_o
 	}
 
 	return 0;
-}
-
-static int go_rdma_exchange_peer_info(go_rdma_conn *conn, int timeout_ms, char **err_out) {
-	if (conn == NULL || conn->id == NULL) {
-		go_rdma_set_err(err_out, "go_rdma_exchange_peer_info: conn closed");
-		return EBADF;
-	}
-	if (conn->rx_region == NULL || conn->rx_mr == NULL || conn->local_ctrl == NULL || conn->local_ctrl_mr == NULL) {
-		go_rdma_set_err(err_out, "go_rdma_exchange_peer_info: conn local resources not initialized");
-		return EINVAL;
-	}
-
-	const size_t info_size = sizeof(go_rdma_peer_info);
-	uint8_t *send_info_buf = (uint8_t *)malloc(info_size);
-	uint8_t *recv_info_buf = (uint8_t *)malloc(info_size);
-	if (send_info_buf == NULL || recv_info_buf == NULL) {
-		free(send_info_buf);
-		free(recv_info_buf);
-		go_rdma_set_errno(err_out, "malloc peer info");
-		return errno != 0 ? errno : ENOMEM;
-	}
-
-	struct ibv_mr *send_info_mr = rdma_reg_msgs(conn->id, send_info_buf, info_size);
-	if (send_info_mr == NULL) {
-		free(send_info_buf);
-		free(recv_info_buf);
-		go_rdma_set_errno(err_out, "rdma_reg_msgs peer send");
-		return errno != 0 ? errno : EIO;
-	}
-	struct ibv_mr *recv_info_mr = rdma_reg_msgs(conn->id, recv_info_buf, info_size);
-	if (recv_info_mr == NULL) {
-		rdma_dereg_mr(send_info_mr);
-		free(send_info_buf);
-		free(recv_info_buf);
-		go_rdma_set_errno(err_out, "rdma_reg_msgs peer recv");
-		return errno != 0 ? errno : EIO;
-	}
-
-	go_rdma_peer_info local_info;
-	memset(&local_info, 0, sizeof(local_info));
-	local_info.rx_addr = (uint64_t)(uintptr_t)conn->rx_region;
-	local_info.rx_rkey = conn->rx_mr->rkey;
-	local_info.ctrl_addr = (uint64_t)(uintptr_t)conn->local_ctrl;
-	local_info.ctrl_rkey = conn->local_ctrl_mr->rkey;
-	local_info.depth = conn->recv_depth;
-	local_info.frame_cap = conn->frame_cap;
-	local_info.magic = GO_RDMA_PEER_INFO_MAGIC;
-	memcpy(send_info_buf, &local_info, sizeof(local_info));
-
-	int rc = rdma_post_recv(conn->id, (void *)(uintptr_t)0xFFFFFFFEu, recv_info_buf, info_size, recv_info_mr);
-	if (rc != 0) {
-		go_rdma_set_errno(err_out, "rdma_post_recv(peer_info)");
-		rc = errno != 0 ? errno : EIO;
-		goto cleanup;
-	}
-
-	rc = rdma_post_send(conn->id, (void *)(uintptr_t)0xFFFFFFFDu, send_info_buf, info_size, send_info_mr, IBV_SEND_SIGNALED);
-	if (rc != 0) {
-		go_rdma_set_errno(err_out, "rdma_post_send(peer_info)");
-		rc = errno != 0 ? errno : EIO;
-		goto cleanup;
-	}
-
-	rc = go_rdma_wait_send_completion(conn, timeout_ms, "ibv_poll_cq(send_peer_info)", err_out);
-	if (rc != 0) {
-		goto cleanup;
-	}
-
-	struct ibv_wc recv_wc;
-	rc = go_rdma_wait_recv_completion(conn, timeout_ms, "ibv_poll_cq(recv_peer_info)", &recv_wc, err_out);
-	if (rc != 0) {
-		goto cleanup;
-	}
-	if (recv_wc.byte_len < info_size) {
-		go_rdma_set_err(err_out, "peer info short read: %u < %zu", recv_wc.byte_len, info_size);
-		rc = EPROTO;
-		goto cleanup;
-	}
-
-	go_rdma_peer_info remote_info;
-	memcpy(&remote_info, recv_info_buf, sizeof(remote_info));
-	if (remote_info.magic != GO_RDMA_PEER_INFO_MAGIC) {
-		go_rdma_set_err(err_out, "peer info magic mismatch: got=0x%x", remote_info.magic);
-		rc = EPROTO;
-		goto cleanup;
-	}
-	if (remote_info.depth == 0) {
-		go_rdma_set_err(err_out, "peer info invalid depth=0");
-		rc = EPROTO;
-		goto cleanup;
-	}
-	if (remote_info.frame_cap != conn->frame_cap) {
-		go_rdma_set_err(
-			err_out,
-			"peer frame cap mismatch local=%u remote=%u",
-			conn->frame_cap,
-			remote_info.frame_cap
-		);
-		rc = EPROTO;
-		goto cleanup;
-	}
-
-	conn->remote_rx_addr = remote_info.rx_addr;
-	conn->remote_rx_rkey = remote_info.rx_rkey;
-	conn->remote_ctrl_addr = remote_info.ctrl_addr;
-	conn->remote_ctrl_rkey = remote_info.ctrl_rkey;
-	conn->remote_depth = remote_info.depth;
-	conn->remote_frame_cap = remote_info.frame_cap;
-	conn->remote_cons_cache = 0;
-	conn->tx_prod = 0;
-
-	rc = 0;
-
-cleanup:
-	if (send_info_mr != NULL) {
-		rdma_dereg_mr(send_info_mr);
-	}
-	if (recv_info_mr != NULL) {
-		rdma_dereg_mr(recv_info_mr);
-	}
-	free(send_info_buf);
-	free(recv_info_buf);
-	return rc;
-}
-
-static int go_rdma_refresh_remote_cons(go_rdma_conn *conn, int timeout_ms, char **err_out) {
-	if (conn == NULL || conn->id == NULL) {
-		go_rdma_set_err(err_out, "go_rdma_refresh_remote_cons: conn closed");
-		return EBADF;
-	}
-	if (conn->remote_cons_buf == NULL || conn->remote_cons_mr == NULL) {
-		go_rdma_set_err(err_out, "go_rdma_refresh_remote_cons: local read buffer not initialized");
-		return EINVAL;
-	}
-	if (conn->remote_ctrl_addr == 0 || conn->remote_ctrl_rkey == 0) {
-		go_rdma_set_err(err_out, "go_rdma_refresh_remote_cons: remote ctrl metadata missing");
-		return EINVAL;
-	}
-
-	struct ibv_sge sge;
-	memset(&sge, 0, sizeof(sge));
-	sge.addr = (uintptr_t)conn->remote_cons_buf;
-	sge.length = sizeof(uint32_t);
-	sge.lkey = conn->remote_cons_mr->lkey;
-
-	struct ibv_send_wr wr;
-	memset(&wr, 0, sizeof(wr));
-	wr.wr_id = (uintptr_t)0xFFFFFFFCu;
-	wr.sg_list = &sge;
-	wr.num_sge = 1;
-	wr.opcode = IBV_WR_RDMA_READ;
-	wr.send_flags = IBV_SEND_SIGNALED;
-	wr.wr.rdma.remote_addr = conn->remote_ctrl_addr + (uint64_t)offsetof(go_rdma_ring_ctrl, cons);
-	wr.wr.rdma.rkey = conn->remote_ctrl_rkey;
-
-	struct ibv_send_wr *bad_wr = NULL;
-	int rc = ibv_post_send(conn->id->qp, &wr, &bad_wr);
-	if (rc != 0) {
-		go_rdma_set_errno(err_out, "ibv_post_send(rdma_read_cons)");
-		return errno != 0 ? errno : EIO;
-	}
-
-	rc = go_rdma_wait_send_completion(conn, timeout_ms, "ibv_poll_cq(read_cons)", err_out);
-	if (rc != 0) {
-		return rc;
-	}
-
-	__sync_synchronize();
-	conn->remote_cons_cache = __atomic_load_n(conn->remote_cons_buf, __ATOMIC_ACQUIRE);
-	return 0;
-}
-
-static int go_rdma_wait_remote_slot(go_rdma_conn *conn, int timeout_ms, char **err_out) {
-	if (conn == NULL || conn->id == NULL) {
-		go_rdma_set_err(err_out, "go_rdma_wait_remote_slot: conn closed");
-		return EBADF;
-	}
-	if (conn->remote_depth == 0) {
-		go_rdma_set_err(err_out, "go_rdma_wait_remote_slot: remote depth not initialized");
-		return EINVAL;
-	}
-
-	int64_t deadline_us = -1;
-	if (timeout_ms >= 0) {
-		int64_t now_us = go_rdma_now_monotonic_us();
-		if (now_us < 0) {
-			go_rdma_set_errno(err_out, "clock_gettime");
-			return errno != 0 ? errno : EIO;
-		}
-		deadline_us = now_us + ((int64_t)timeout_ms * 1000LL);
-	}
-
-	for (;;) {
-		uint32_t outstanding = conn->tx_prod - conn->remote_cons_cache;
-		if (outstanding < conn->remote_depth) {
-			return 0;
-		}
-
-		int read_timeout_ms = timeout_ms;
-		if (deadline_us >= 0) {
-			int64_t now_us = go_rdma_now_monotonic_us();
-			if (now_us < 0) {
-				go_rdma_set_errno(err_out, "clock_gettime");
-				return errno != 0 ? errno : EIO;
-			}
-			if (now_us >= deadline_us) {
-				return EAGAIN;
-			}
-			int64_t remain_us = deadline_us - now_us;
-			read_timeout_ms = (int)((remain_us + 999LL) / 1000LL);
-			if (read_timeout_ms < 1) {
-				read_timeout_ms = 1;
-			}
-		}
-
-		int rc = go_rdma_refresh_remote_cons(conn, read_timeout_ms, err_out);
-		if (rc != 0) {
-			return rc;
-		}
-
-		outstanding = conn->tx_prod - conn->remote_cons_cache;
-		if (outstanding < conn->remote_depth) {
-			return 0;
-		}
-
-		if (deadline_us >= 0) {
-			int64_t now_us = go_rdma_now_monotonic_us();
-			if (now_us < 0) {
-				go_rdma_set_errno(err_out, "clock_gettime");
-				return errno != 0 ? errno : EIO;
-			}
-			if (now_us >= deadline_us) {
-				return EAGAIN;
-			}
-		}
-
-		if (go_rdma_sleep_us(GO_RDMA_FLOW_WAIT_US) != 0) {
-			go_rdma_set_errno(err_out, "nanosleep(flow_wait)");
-			return errno != 0 ? errno : EIO;
-		}
-	}
 }
 
 static int go_rdma_open(
@@ -962,7 +639,7 @@ static int go_rdma_open(
 	}
 	*out = NULL;
 
-	if (frame_cap <= GO_RDMA_FRAME_HEADER_SIZE) {
+	if (frame_cap == 0) {
 		go_rdma_set_err(err_out, "go_rdma_open: invalid frame_cap=%u", frame_cap);
 		return EINVAL;
 	}
@@ -1135,76 +812,6 @@ static int go_rdma_open(
 		goto cleanup;
 	}
 
-	size_t rx_region_size = (size_t)frame_cap * (size_t)recv_wr;
-	if (recv_wr > 0 && rx_region_size / recv_wr != frame_cap) {
-		go_rdma_set_err(err_out, "recv ring size overflow");
-		rc = EOVERFLOW;
-		goto cleanup;
-	}
-
-	conn->rx_region = (uint8_t *)malloc(rx_region_size);
-	if (conn->rx_region == NULL) {
-		go_rdma_set_errno(err_out, "malloc rx ring");
-		rc = errno != 0 ? errno : ENOMEM;
-		goto cleanup;
-	}
-
-	struct ibv_pd *pd = go_rdma_pd(conn);
-	if (pd == NULL) {
-		go_rdma_set_err(err_out, "rdma pd is nil for rx ring registration");
-		rc = EIO;
-		goto cleanup;
-	}
-	conn->rx_mr = ibv_reg_mr(
-		pd,
-		conn->rx_region,
-		rx_region_size,
-		IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE
-	);
-	if (conn->rx_mr == NULL) {
-		go_rdma_set_errno(err_out, "ibv_reg_mr rx ring");
-		rc = errno != 0 ? errno : EIO;
-		goto cleanup;
-	}
-
-	conn->local_ctrl = (go_rdma_ring_ctrl *)calloc(1, sizeof(go_rdma_ring_ctrl));
-	if (conn->local_ctrl == NULL) {
-		go_rdma_set_errno(err_out, "calloc local ctrl");
-		rc = errno != 0 ? errno : ENOMEM;
-		goto cleanup;
-	}
-
-	conn->local_ctrl_mr = ibv_reg_mr(
-		pd,
-		conn->local_ctrl,
-		sizeof(go_rdma_ring_ctrl),
-		IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ
-	);
-	if (conn->local_ctrl_mr == NULL) {
-		go_rdma_set_errno(err_out, "ibv_reg_mr local ctrl");
-		rc = errno != 0 ? errno : EIO;
-		goto cleanup;
-	}
-
-	conn->remote_cons_buf = (uint32_t *)calloc(1, sizeof(uint32_t));
-	if (conn->remote_cons_buf == NULL) {
-		go_rdma_set_errno(err_out, "calloc remote cons read buffer");
-		rc = errno != 0 ? errno : ENOMEM;
-		goto cleanup;
-	}
-
-	conn->remote_cons_mr = ibv_reg_mr(
-		pd,
-		conn->remote_cons_buf,
-		sizeof(uint32_t),
-		IBV_ACCESS_LOCAL_WRITE
-	);
-	if (conn->remote_cons_mr == NULL) {
-		go_rdma_set_errno(err_out, "ibv_reg_mr remote cons read buffer");
-		rc = errno != 0 ? errno : EIO;
-		goto cleanup;
-	}
-
 	struct rdma_conn_param conn_param;
 	memset(&conn_param, 0, sizeof(conn_param));
 	conn_param.responder_resources = 1;
@@ -1260,7 +867,7 @@ static int go_rdma_listen(
 	}
 	*out = NULL;
 
-	if (frame_cap <= GO_RDMA_FRAME_HEADER_SIZE) {
+	if (frame_cap == 0) {
 		go_rdma_set_err(err_out, "go_rdma_listen: invalid frame_cap=%u", frame_cap);
 		return EINVAL;
 	}
@@ -1536,76 +1143,6 @@ static int go_rdma_accept(
 		return errno != 0 ? errno : EIO;
 	}
 
-	size_t rx_region_size = (size_t)listener->frame_cap * (size_t)listener->recv_wr;
-	if (listener->recv_wr > 0 && rx_region_size / listener->recv_wr != listener->frame_cap) {
-		go_rdma_set_err(err_out, "recv ring size overflow(accept)");
-		go_rdma_free_conn(conn);
-		return EOVERFLOW;
-	}
-
-	conn->rx_region = (uint8_t *)malloc(rx_region_size);
-	if (conn->rx_region == NULL) {
-		go_rdma_set_errno(err_out, "malloc rx ring(accept)");
-		go_rdma_free_conn(conn);
-		return errno != 0 ? errno : ENOMEM;
-	}
-
-	struct ibv_pd *pd = go_rdma_pd(conn);
-	if (pd == NULL) {
-		go_rdma_set_err(err_out, "rdma pd is nil for rx ring registration(accept)");
-		go_rdma_free_conn(conn);
-		return EIO;
-	}
-	conn->rx_mr = ibv_reg_mr(
-		pd,
-		conn->rx_region,
-		rx_region_size,
-		IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE
-	);
-	if (conn->rx_mr == NULL) {
-		go_rdma_set_errno(err_out, "ibv_reg_mr rx ring(accept)");
-		go_rdma_free_conn(conn);
-		return errno != 0 ? errno : EIO;
-	}
-
-	conn->local_ctrl = (go_rdma_ring_ctrl *)calloc(1, sizeof(go_rdma_ring_ctrl));
-	if (conn->local_ctrl == NULL) {
-		go_rdma_set_errno(err_out, "calloc local ctrl(accept)");
-		go_rdma_free_conn(conn);
-		return errno != 0 ? errno : ENOMEM;
-	}
-
-	conn->local_ctrl_mr = ibv_reg_mr(
-		pd,
-		conn->local_ctrl,
-		sizeof(go_rdma_ring_ctrl),
-		IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ
-	);
-	if (conn->local_ctrl_mr == NULL) {
-		go_rdma_set_errno(err_out, "ibv_reg_mr local ctrl(accept)");
-		go_rdma_free_conn(conn);
-		return errno != 0 ? errno : EIO;
-	}
-
-	conn->remote_cons_buf = (uint32_t *)calloc(1, sizeof(uint32_t));
-	if (conn->remote_cons_buf == NULL) {
-		go_rdma_set_errno(err_out, "calloc remote cons read buffer(accept)");
-		go_rdma_free_conn(conn);
-		return errno != 0 ? errno : ENOMEM;
-	}
-
-	conn->remote_cons_mr = ibv_reg_mr(
-		pd,
-		conn->remote_cons_buf,
-		sizeof(uint32_t),
-		IBV_ACCESS_LOCAL_WRITE
-	);
-	if (conn->remote_cons_mr == NULL) {
-		go_rdma_set_errno(err_out, "ibv_reg_mr remote cons read buffer(accept)");
-		go_rdma_free_conn(conn);
-		return errno != 0 ? errno : EIO;
-	}
-
 	struct rdma_conn_param conn_param;
 	memset(&conn_param, 0, sizeof(conn_param));
 	conn_param.responder_resources = 1;
@@ -1639,8 +1176,6 @@ static int go_rdma_send_frame(
 	go_rdma_conn *conn,
 	const uint8_t *payload,
 	uint32_t payload_len,
-	uint32_t total_len,
-	uint32_t offset,
 	int force_signal,
 	int timeout_ms,
 	char **err_out
@@ -1650,17 +1185,9 @@ static int go_rdma_send_frame(
 		return EBADF;
 	}
 
-	if ((uint64_t)GO_RDMA_FRAME_HEADER_SIZE + payload_len > conn->frame_cap) {
+	if ((uint64_t)payload_len > conn->frame_cap) {
 		go_rdma_set_err(err_out, "go_rdma_send_frame: payload_len=%u exceeds frame capacity", payload_len);
 		return EMSGSIZE;
-	}
-	if ((uint64_t)offset + payload_len > total_len) {
-		go_rdma_set_err(err_out, "go_rdma_send_frame: invalid range offset=%u payload=%u total=%u", offset, payload_len, total_len);
-		return EINVAL;
-	}
-	if (conn->remote_depth == 0 || conn->remote_rx_addr == 0 || conn->remote_rx_rkey == 0) {
-		go_rdma_set_err(err_out, "go_rdma_send_frame: remote peer info not initialized");
-		return EINVAL;
 	}
 	if (conn->send_depth == 0) {
 		go_rdma_set_err(err_out, "go_rdma_send_frame: local send depth not initialized");
@@ -1672,27 +1199,13 @@ static int go_rdma_send_frame(
 		return rc;
 	}
 
-	uint32_t total_n = htonl(total_len);
-	uint32_t offset_n = htonl(offset);
-	uint32_t payload_n = htonl(payload_len);
-
 	uint32_t local_slot = conn->tx_prod % conn->send_depth;
 	uint8_t *local_buf = conn->send_buf + ((size_t)local_slot * conn->frame_cap);
-	memcpy(local_buf, &total_n, sizeof(total_n));
-	memcpy(local_buf + 4, &offset_n, sizeof(offset_n));
-	memcpy(local_buf + 8, &payload_n, sizeof(payload_n));
 
 	if (payload_len > 0 && payload != NULL) {
-		memcpy(local_buf + GO_RDMA_FRAME_HEADER_SIZE, payload, payload_len);
+		memcpy(local_buf, payload, payload_len);
 	}
-	rc = go_rdma_wait_remote_slot(conn, timeout_ms, err_out);
-	if (rc != 0) {
-		return rc;
-	}
-
-	uint32_t remote_slot = conn->tx_prod % conn->remote_depth;
-	uint64_t remote_addr = conn->remote_rx_addr + ((uint64_t)remote_slot * conn->remote_frame_cap);
-	uint32_t send_len = GO_RDMA_FRAME_HEADER_SIZE + payload_len;
+	uint32_t send_len = payload_len;
 
 	struct ibv_sge sge;
 	memset(&sge, 0, sizeof(sge));
@@ -1705,11 +1218,8 @@ static int go_rdma_send_frame(
 	wr.wr_id = (uintptr_t)conn->tx_prod;
 	wr.sg_list = &sge;
 	wr.num_sge = 1;
-	wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-	wr.imm_data = htonl(remote_slot);
+	wr.opcode = IBV_WR_SEND;
 	wr.send_flags = 0;
-	wr.wr.rdma.remote_addr = remote_addr;
-	wr.wr.rdma.rkey = conn->remote_rx_rkey;
 
 	int send_flags = 0;
 	uint32_t outstanding = conn->tx_prod - conn->send_completed;
@@ -1735,13 +1245,87 @@ static int go_rdma_send_frame(
 	struct ibv_send_wr *bad_wr = NULL;
 	rc = ibv_post_send(conn->id->qp, &wr, &bad_wr);
 	if (rc != 0) {
-		go_rdma_set_errno(err_out, "ibv_post_send(write_with_imm)");
+		go_rdma_set_errno(err_out, "ibv_post_send(send_data)");
 		return errno != 0 ? errno : EIO;
 	}
 
 	conn->tx_prod++;
-	__atomic_store_n(&conn->local_ctrl->prod, conn->tx_prod, __ATOMIC_RELEASE);
 
+	return 0;
+}
+
+static int go_rdma_send_message(
+	go_rdma_conn *conn,
+	const uint8_t *payload,
+	uint32_t total_len,
+	int timeout_ms,
+	char **err_out
+) {
+	if (conn == NULL || conn->id == NULL) {
+		go_rdma_set_err(err_out, "go_rdma_send_message: conn closed");
+		return EBADF;
+	}
+
+	if (total_len == 0) {
+		return 0;
+	}
+	if (payload == NULL) {
+		go_rdma_set_err(err_out, "go_rdma_send_message: payload is nil");
+		return EINVAL;
+	}
+
+	uint32_t payload_cap = conn->frame_cap;
+	if (payload_cap == 0) {
+		go_rdma_set_err(err_out, "go_rdma_send_message: invalid payload capacity");
+		return EINVAL;
+	}
+
+	uint32_t offset = 0;
+	while (offset < total_len) {
+		uint32_t remaining = total_len - offset;
+		uint32_t chunk_len = payload_cap;
+		if (chunk_len > remaining) {
+			chunk_len = remaining;
+		}
+		int force_signal = (offset + chunk_len >= total_len) ? 1 : 0;
+			int rc = go_rdma_send_frame(
+				conn,
+				payload + offset,
+				chunk_len,
+				force_signal,
+				timeout_ms,
+				err_out
+		);
+		if (rc != 0) {
+			return rc;
+		}
+		offset += chunk_len;
+	}
+
+	// Do not flush on every message. Keep send path asynchronous and rely on
+	// queue-depth pressure to reap completions when needed.
+	return 0;
+}
+
+static int go_rdma_release_last_recv_slot(
+	go_rdma_conn *conn,
+	char **err_out
+) {
+	if (conn == NULL || conn->id == NULL) {
+		go_rdma_set_err(err_out, "go_rdma_release_last_recv_slot: conn closed");
+		return EBADF;
+	}
+	if (!conn->has_last_notify_slot) {
+		return 0;
+	}
+
+	uint32_t idx = conn->last_notify_slot;
+	int rc = go_rdma_post_notify_recv_slot(conn, idx, err_out);
+	if (rc != 0) {
+		return rc;
+	}
+
+	conn->has_last_notify_slot = 0;
 	return 0;
 }
 
@@ -1762,21 +1346,22 @@ static int go_rdma_recv_frame(
 		go_rdma_set_err(err_out, "go_rdma_recv_frame: nil output parameter");
 		return EINVAL;
 	}
-	if (conn->rx_region == NULL || conn->notify_slots == NULL) {
+	if (conn->notify_slots == NULL) {
 		go_rdma_set_err(err_out, "go_rdma_recv_frame: conn receive resources not initialized");
 		return EINVAL;
 	}
 
-	struct ibv_wc wc;
-	int rc = go_rdma_wait_recv_completion(conn, timeout_ms, "ibv_poll_cq(recv_imm)", &wc, err_out);
+	int rc = go_rdma_release_last_recv_slot(conn, err_out);
 	if (rc != 0) {
 		return rc;
 	}
-	if ((wc.wc_flags & IBV_WC_WITH_IMM) == 0) {
-		go_rdma_set_err(err_out, "go_rdma_recv_frame: completion missing immediate data");
-		return EPROTO;
+
+	struct ibv_wc wc;
+	rc = go_rdma_wait_recv_completion(conn, timeout_ms, "ibv_poll_cq(recv_data)", &wc, err_out);
+	if (rc != 0) {
+		return rc;
 	}
-	if (wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM && wc.opcode != IBV_WC_RECV) {
+	if (wc.opcode != IBV_WC_RECV) {
 		go_rdma_set_err(err_out, "go_rdma_recv_frame: unexpected recv opcode=%u", wc.opcode);
 		return EPROTO;
 	}
@@ -1787,34 +1372,18 @@ static int go_rdma_recv_frame(
 		return EIO;
 	}
 	uint32_t notify_idx = (uint32_t)(wr - 1);
+	uint8_t *slot_buf = conn->notify_slots[notify_idx].buf;
 
-	uint32_t data_slot = ntohl(wc.imm_data);
-	if (data_slot >= conn->recv_depth) {
-		go_rdma_set_err(err_out, "invalid data slot in imm=%u recv_depth=%u", data_slot, conn->recv_depth);
-		return EPROTO;
-	}
-	uint8_t *slot_buf = conn->rx_region + ((size_t)data_slot * conn->frame_cap);
+	*payload_len = wc.byte_len;
+	*total_len = wc.byte_len;
+	*offset = 0;
 
-	uint32_t total_n = 0;
-	uint32_t offset_n = 0;
-	uint32_t payload_n = 0;
-	memcpy(&total_n, slot_buf, 4);
-	memcpy(&offset_n, slot_buf + 4, 4);
-	memcpy(&payload_n, slot_buf + 8, 4);
-	*total_len = ntohl(total_n);
-	*offset = ntohl(offset_n);
-	*payload_len = ntohl(payload_n);
-
-	if ((uint64_t)GO_RDMA_FRAME_HEADER_SIZE + *payload_len > conn->frame_cap) {
+	if (*payload_len > conn->frame_cap) {
 		go_rdma_set_err(err_out, "frame payload length invalid payload=%u frame_cap=%u", *payload_len, conn->frame_cap);
 		return EPROTO;
 	}
-	if ((uint64_t)(*offset) + (*payload_len) > *total_len) {
-		go_rdma_set_err(err_out, "frame range invalid offset=%u payload=%u total=%u", *offset, *payload_len, *total_len);
-		return EPROTO;
-	}
 
-	*payload_ptr = slot_buf + GO_RDMA_FRAME_HEADER_SIZE;
+	*payload_ptr = slot_buf;
 	conn->last_notify_slot = notify_idx;
 	conn->has_last_notify_slot = 1;
 	return 0;
@@ -1829,31 +1398,7 @@ static int go_rdma_repost_recv(go_rdma_conn *conn, char **err_out) {
 		go_rdma_set_err(err_out, "go_rdma_repost_recv: no recv slot to repost");
 		return EINVAL;
 	}
-
-	uint32_t idx = conn->last_notify_slot;
-	int rc = go_rdma_post_notify_recv_slot(conn, idx, err_out);
-	if (rc != 0) {
-		return rc;
-	}
-
-	__atomic_add_fetch(&conn->local_ctrl->cons, 1, __ATOMIC_RELEASE);
-	conn->has_last_notify_slot = 0;
-	return 0;
-}
-
-static int go_rdma_flush_send(go_rdma_conn *conn, int timeout_ms, char **err_out) {
-	if (conn == NULL || conn->id == NULL) {
-		go_rdma_set_err(err_out, "go_rdma_flush_send: conn closed");
-		return EBADF;
-	}
-
-	while (conn->send_completed < conn->tx_prod) {
-		int rc = go_rdma_reap_data_send_completion(conn, timeout_ms, err_out);
-		if (rc != 0) {
-			return rc;
-		}
-	}
-	return 0;
+	return go_rdma_release_last_recv_slot(conn, err_out);
 }
 
 static void go_rdma_close(go_rdma_conn *conn) {
@@ -1880,8 +1425,7 @@ import (
 )
 
 const (
-	verbsBackendEnabled  = true
-	verbsFrameHeaderSize = 12
+	verbsBackendEnabled = true
 	// Allow RDMA Open to survive connection bursts where CM/QP setup may
 	// temporarily queue for multiple seconds.
 	verbsOpenTimeoutMills = 3000
@@ -1903,12 +1447,10 @@ type verbsMessageConn struct {
 	readyMu sync.Mutex
 	ready   bool
 
-	recvFrameMu   sync.Mutex
-	recvFrameHeld bool
+	recvFrameMu sync.Mutex
 }
 
 var _ MessageConn = (*verbsMessageConn)(nil)
-var _ frameReadableMessageConn = (*verbsMessageConn)(nil)
 
 type verbsListener struct {
 	mu sync.RWMutex
@@ -1938,8 +1480,8 @@ func newVerbsListener(network, address string, opts VerbsListenerOptions) (net.L
 		return nil, err
 	}
 
-	frameCap := cfg.framePayloadSize + verbsFrameHeaderSize
-	if frameCap <= verbsFrameHeaderSize {
+	frameCap := cfg.framePayloadSize
+	if frameCap <= 0 {
 		return nil, fmt.Errorf("rdma verbs: invalid frame capacity")
 	}
 
@@ -2155,8 +1697,8 @@ func (o VerbsOptions) Open(ctx context.Context, network, address string) (Messag
 		return nil, err
 	}
 
-	frameCap := cfg.framePayloadSize + verbsFrameHeaderSize
-	if frameCap <= verbsFrameHeaderSize {
+	frameCap := cfg.framePayloadSize
+	if frameCap <= 0 {
 		return nil, fmt.Errorf("rdma verbs: invalid frame capacity")
 	}
 
@@ -2325,59 +1867,25 @@ func (c *verbsMessageConn) SendMessage(ctx context.Context, payload []byte) erro
 	if err := c.ensureReady(ctx); err != nil {
 		return err
 	}
-
-	total := len(payload)
-	if total == 0 {
-		if err := c.sendFrame(ctx, nil, 0, 0, true); err != nil {
-			return err
-		}
-		return c.flushSend(ctx)
-	}
-
-	for offset := 0; offset < total; offset += c.framePayloadSize {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		chunkLen := c.framePayloadSize
-		remaining := total - offset
-		if remaining < chunkLen {
-			chunkLen = remaining
-		}
-
-		chunk := payload[offset : offset+chunkLen]
-		forceSignal := offset+chunkLen >= total
-		if err := c.sendFrame(ctx, chunk, total, offset, forceSignal); err != nil {
-			return err
-		}
-	}
-
-	return c.flushSend(ctx)
-}
-
-func (c *verbsMessageConn) sendFrame(ctx context.Context, chunk []byte, totalLen int, offset int, forceSignal bool) error {
 	timeoutMS, err := rdmaContextTimeoutMillis(ctx)
 	if err != nil {
 		return err
 	}
 
 	var payloadPtr *C.uint8_t
-	if len(chunk) > 0 {
-		payloadPtr = (*C.uint8_t)(unsafe.Pointer(&chunk[0]))
+	if len(payload) > 0 {
+		payloadPtr = (*C.uint8_t)(unsafe.Pointer(&payload[0]))
 	}
 
 	var cErr *C.char
-	rc := C.go_rdma_send_frame(
+	rc := C.go_rdma_send_message(
 		c.cc,
 		payloadPtr,
-		C.uint32_t(len(chunk)),
-		C.uint32_t(totalLen),
-		C.uint32_t(offset),
-		boolToCInt(forceSignal),
+		C.uint32_t(len(payload)),
 		timeoutMS,
 		&cErr,
 	)
-	runtime.KeepAlive(chunk)
+	runtime.KeepAlive(payload)
 	if rc != 0 {
 		if rc == C.int(C.EAGAIN) {
 			if err := ctx.Err(); err != nil {
@@ -2390,37 +1898,12 @@ func (c *verbsMessageConn) sendFrame(ctx context.Context, chunk []byte, totalLen
 	return nil
 }
 
-func (c *verbsMessageConn) flushSend(ctx context.Context) error {
-	timeoutMS, err := rdmaContextTimeoutMillis(ctx)
-	if err != nil {
-		return err
-	}
-
-	var cErr *C.char
-	rc := C.go_rdma_flush_send(c.cc, timeoutMS, &cErr)
-	if rc != 0 {
-		if rc == C.int(C.EAGAIN) {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			return context.DeadlineExceeded
-		}
-		return rdmaCError("flush_send", rc, cErr)
-	}
-	return nil
-}
-
 func (c *verbsMessageConn) RecvFrame(ctx context.Context) ([]byte, int, int, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, 0, err
 	}
 
 	c.recvFrameMu.Lock()
-	if c.recvFrameHeld {
-		c.recvFrameMu.Unlock()
-		return nil, 0, 0, errors.New("rdma verbs: recv frame called before repost")
-	}
-
 	c.mu.RLock()
 	if c.cc == nil {
 		c.mu.RUnlock()
@@ -2467,8 +1950,6 @@ func (c *verbsMessageConn) RecvFrame(ctx context.Context) ([]byte, int, int, err
 		c.recvFrameMu.Unlock()
 		return nil, 0, 0, fmt.Errorf("rdma verbs: invalid frame range offset=%d payload=%d total=%d", offset, payloadN, total)
 	}
-
-	c.recvFrameHeld = true
 	c.recvFrameMu.Unlock()
 
 	payload := unsafe.Slice((*byte)(unsafe.Pointer(payloadPtr)), payloadN)
@@ -2477,11 +1958,7 @@ func (c *verbsMessageConn) RecvFrame(ctx context.Context) ([]byte, int, int, err
 
 func (c *verbsMessageConn) RepostFrame() error {
 	c.recvFrameMu.Lock()
-	held := c.recvFrameHeld
-	c.recvFrameMu.Unlock()
-	if !held {
-		return errors.New("rdma verbs: no recv frame to repost")
-	}
+	defer c.recvFrameMu.Unlock()
 
 	c.mu.RLock()
 	if c.cc == nil {
@@ -2493,10 +1970,6 @@ func (c *verbsMessageConn) RepostFrame() error {
 	if err != nil {
 		return err
 	}
-
-	c.recvFrameMu.Lock()
-	c.recvFrameHeld = false
-	c.recvFrameMu.Unlock()
 	return nil
 }
 
@@ -2504,10 +1977,6 @@ func (c *verbsMessageConn) RecvMessage(ctx context.Context) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
-	var msg []byte
-	var total int
-	received := 0
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -2524,36 +1993,13 @@ func (c *verbsMessageConn) RecvMessage(ctx context.Context) ([]byte, error) {
 			return nil, err
 		}
 		payloadLenN := len(payload)
-
-		if msg == nil {
-			total = frameTotalN
-			if total < 0 {
-				_ = c.RepostFrame()
-				return nil, fmt.Errorf("rdma verbs: invalid total message length %d", total)
-			}
-			msg = make([]byte, total)
-		} else if frameTotalN != total {
-			_ = c.RepostFrame()
-			return nil, fmt.Errorf("rdma verbs: inconsistent frame total %d, expected %d", frameTotalN, total)
+		if frameTotalN != payloadLenN || offsetN != 0 {
+			return nil, fmt.Errorf(
+				"rdma verbs: unsupported multi-frame receive total=%d payload=%d offset=%d",
+				frameTotalN, payloadLenN, offsetN,
+			)
 		}
-
-		if offsetN < 0 || payloadLenN < 0 || offsetN+payloadLenN > total {
-			_ = c.RepostFrame()
-			return nil, fmt.Errorf("rdma verbs: invalid frame range offset=%d payload=%d total=%d", offsetN, payloadLenN, total)
-		}
-
-		if payloadLenN > 0 {
-			copy(msg[offsetN:offsetN+payloadLenN], payload)
-		}
-
-		if err := c.RepostFrame(); err != nil {
-			return nil, err
-		}
-
-		received += payloadLenN
-		if received == total {
-			return msg, nil
-		}
+		return payload, nil
 	}
 }
 
@@ -2647,13 +2093,6 @@ func rdmaContextTimeoutMillis(ctx context.Context) (C.int, error) {
 	}
 
 	return C.int(ms), nil
-}
-
-func boolToCInt(v bool) C.int {
-	if v {
-		return 1
-	}
-	return 0
 }
 
 func rdmaOpenTimeoutMillis(ctx context.Context) (C.int, error) {

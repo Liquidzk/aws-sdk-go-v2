@@ -14,10 +14,6 @@ var (
 	// SetReadDeadline can interrupt in-flight reads. A larger slice reduces
 	// idle wakeups/cgo churn at the cost of deadline reaction granularity.
 	readPollInterval = 500 * time.Millisecond
-
-	// defaultWriteTimeout bounds write-side stalls when net/http does not set
-	// a write deadline for the connection.
-	defaultWriteTimeout = 5 * time.Second
 )
 
 // MessageConn models an ordered, reliable message channel that can be adapted
@@ -35,11 +31,6 @@ type MessageConn interface {
 	RemoteAddr() net.Addr
 }
 
-type frameReadableMessageConn interface {
-	RecvFrame(ctx context.Context) (payload []byte, totalLen int, offset int, err error)
-	RepostFrame() error
-}
-
 // Conn adapts a MessageConn into net.Conn semantics so it can be used by
 // net/http transports.
 type Conn struct {
@@ -48,16 +39,13 @@ type Conn struct {
 	readMu  sync.Mutex
 	writeMu sync.Mutex
 
+	readCancelMu       sync.Mutex
+	readInflightCancel context.CancelFunc
+
 	closeOnce sync.Once
 	closeErr  error
 
 	readBuf []byte
-
-	frameBuf         []byte
-	frameBufPos      int
-	frameMsgActive   bool
-	frameMsgTotal    int
-	frameMsgReceived int
 
 	deadlineMu    sync.RWMutex
 	readDeadline  time.Time
@@ -82,10 +70,6 @@ func (c *Conn) Read(p []byte) (int, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
-	if fr, ok := c.stream.(frameReadableMessageConn); ok {
-		return c.readFromFrames(fr, p)
-	}
-
 	for len(c.readBuf) == 0 {
 		msg, err := c.recvWithDeadline()
 		if err != nil {
@@ -106,101 +90,6 @@ func (c *Conn) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func (c *Conn) readFromFrames(fr frameReadableMessageConn, p []byte) (int, error) {
-	for {
-		if len(c.frameBuf) == 0 {
-			payload, total, offset, err := c.recvFrameWithDeadline(fr)
-			if err != nil {
-				return 0, err
-			}
-
-			if err := c.attachFrameState(total, offset, len(payload)); err != nil {
-				_ = fr.RepostFrame()
-				return 0, err
-			}
-			c.frameBuf = payload
-			c.frameBufPos = 0
-
-			if len(c.frameBuf) == 0 {
-				if err := fr.RepostFrame(); err != nil {
-					return 0, err
-				}
-				if c.frameMsgActive && c.frameMsgReceived == c.frameMsgTotal {
-					c.frameMsgActive = false
-					c.frameMsgTotal = 0
-					c.frameMsgReceived = 0
-				}
-				continue
-			}
-		}
-
-		n := copy(p, c.frameBuf[c.frameBufPos:])
-		c.frameBufPos += n
-		c.frameMsgReceived += n
-
-		if c.frameBufPos == len(c.frameBuf) {
-			c.frameBuf = nil
-			c.frameBufPos = 0
-			if err := fr.RepostFrame(); err != nil {
-				return n, err
-			}
-			if c.frameMsgActive && c.frameMsgReceived == c.frameMsgTotal {
-				c.frameMsgActive = false
-				c.frameMsgTotal = 0
-				c.frameMsgReceived = 0
-			}
-		}
-
-		if n > 0 {
-			return n, nil
-		}
-	}
-}
-
-func (c *Conn) recvFrameWithDeadline(fr frameReadableMessageConn) ([]byte, int, int, error) {
-	for {
-		deadline := c.getReadDeadline()
-		ctx, cancel := c.contextWithReadSlice(deadline)
-		payload, total, offset, err := fr.RecvFrame(ctx)
-		cancel()
-		if err == nil {
-			return payload, total, offset, nil
-		}
-
-		if errors.Is(err, context.DeadlineExceeded) {
-			if !deadline.IsZero() && !time.Now().Before(deadline) {
-				return nil, 0, 0, os.ErrDeadlineExceeded
-			}
-			continue
-		}
-		return nil, 0, 0, normalizeContextErr(err)
-	}
-}
-
-func (c *Conn) attachFrameState(total, offset, payloadLen int) error {
-	if total < 0 || offset < 0 || payloadLen < 0 || offset+payloadLen > total {
-		return net.InvalidAddrError("rdma frame range invalid")
-	}
-
-	if !c.frameMsgActive {
-		if offset != 0 {
-			return net.InvalidAddrError("rdma frame offset without active message")
-		}
-		c.frameMsgActive = true
-		c.frameMsgTotal = total
-		c.frameMsgReceived = 0
-		return nil
-	}
-
-	if total != c.frameMsgTotal {
-		return net.InvalidAddrError("rdma frame total mismatch")
-	}
-	if offset != c.frameMsgReceived {
-		return net.InvalidAddrError("rdma frame offset mismatch")
-	}
-	return nil
-}
-
 func (c *Conn) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -213,11 +102,11 @@ func (c *Conn) Write(p []byte) (int, error) {
 	defer c.writeMu.Unlock()
 
 	writeDeadline := c.getWriteDeadline()
-	if writeDeadline.IsZero() {
-		writeDeadline = time.Now().Add(defaultWriteTimeout)
+	ctx := context.Background()
+	cancel := func() {}
+	if !writeDeadline.IsZero() {
+		ctx, cancel = c.contextWithDeadline(writeDeadline)
 	}
-
-	ctx, cancel := c.contextWithDeadline(writeDeadline)
 	defer cancel()
 
 	if err := c.stream.SendMessage(ctx, p); err != nil {
@@ -257,6 +146,7 @@ func (c *Conn) SetDeadline(t time.Time) error {
 	c.readDeadline = t
 	c.writeDeadline = t
 	c.deadlineMu.Unlock()
+	c.interruptInflightRead()
 	return nil
 }
 
@@ -264,6 +154,7 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 	c.deadlineMu.Lock()
 	c.readDeadline = t
 	c.deadlineMu.Unlock()
+	c.interruptInflightRead()
 	return nil
 }
 
@@ -277,6 +168,21 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 func (c *Conn) recvWithDeadline() ([]byte, error) {
 	if c.stream == nil {
 		return nil, net.ErrClosed
+	}
+
+	for c.getReadDeadline().IsZero() {
+		ctx, cancel := context.WithCancel(context.Background())
+		c.setInflightReadCancel(cancel)
+		msg, err := c.stream.RecvMessage(ctx)
+		c.clearInflightReadCancel()
+		cancel()
+		if err == nil {
+			return msg, nil
+		}
+		if errors.Is(err, context.Canceled) {
+			continue
+		}
+		return nil, normalizeContextErr(err)
 	}
 
 	for {
@@ -332,6 +238,27 @@ func (c *Conn) contextWithReadSlice(deadline time.Time) (context.Context, contex
 		return context.WithTimeout(context.Background(), readPollInterval)
 	}
 	return context.WithDeadline(context.Background(), deadline)
+}
+
+func (c *Conn) setInflightReadCancel(cancel context.CancelFunc) {
+	c.readCancelMu.Lock()
+	c.readInflightCancel = cancel
+	c.readCancelMu.Unlock()
+}
+
+func (c *Conn) clearInflightReadCancel() {
+	c.readCancelMu.Lock()
+	c.readInflightCancel = nil
+	c.readCancelMu.Unlock()
+}
+
+func (c *Conn) interruptInflightRead() {
+	c.readCancelMu.Lock()
+	cancel := c.readInflightCancel
+	c.readCancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func normalizeContextErr(err error) error {

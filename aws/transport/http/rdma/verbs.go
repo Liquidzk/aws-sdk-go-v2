@@ -32,7 +32,7 @@ const (
 // VerbsOptions controls the RDMA verbs backend used by Dialer.Open.
 type VerbsOptions struct {
 	// FramePayloadSize controls max payload bytes sent in one RDMA SEND work
-	// request (excluding internal frame header).
+	// request.
 	FramePayloadSize int
 
 	// SendQueueDepth controls max outstanding SEND work requests on QP.

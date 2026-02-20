@@ -25,80 +25,6 @@ type mockMessageConn struct {
 	remote  net.Addr
 }
 
-type mockFrame struct {
-	payload []byte
-	total   int
-	offset  int
-}
-
-type mockFrameMessageConn struct {
-	frames []mockFrame
-
-	mu            sync.Mutex
-	next          int
-	needsRepost   bool
-	repostCalls   int32
-	recvMsgCalls  int32
-	closeFn       func() error
-	local, remote net.Addr
-}
-
-func (m *mockFrameMessageConn) SendMessage(ctx context.Context, payload []byte) error {
-	return nil
-}
-
-func (m *mockFrameMessageConn) RecvMessage(ctx context.Context) ([]byte, error) {
-	atomic.AddInt32(&m.recvMsgCalls, 1)
-	return nil, errors.New("unexpected RecvMessage call")
-}
-
-func (m *mockFrameMessageConn) RecvFrame(ctx context.Context) ([]byte, int, int, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.needsRepost {
-		return nil, 0, 0, errors.New("frame consumed before repost")
-	}
-	if m.next >= len(m.frames) {
-		return nil, 0, 0, io.EOF
-	}
-	f := m.frames[m.next]
-	m.next++
-	m.needsRepost = true
-	return append([]byte(nil), f.payload...), f.total, f.offset, nil
-}
-
-func (m *mockFrameMessageConn) RepostFrame() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if !m.needsRepost {
-		return errors.New("no frame to repost")
-	}
-	m.needsRepost = false
-	atomic.AddInt32(&m.repostCalls, 1)
-	return nil
-}
-
-func (m *mockFrameMessageConn) Close() error {
-	if m.closeFn != nil {
-		return m.closeFn()
-	}
-	return nil
-}
-
-func (m *mockFrameMessageConn) LocalAddr() net.Addr {
-	if m.local != nil {
-		return m.local
-	}
-	return mockAddr("local")
-}
-
-func (m *mockFrameMessageConn) RemoteAddr() net.Addr {
-	if m.remote != nil {
-		return m.remote
-	}
-	return mockAddr("remote")
-}
-
 func (m *mockMessageConn) SendMessage(ctx context.Context, payload []byte) error {
 	if m.sendFn != nil {
 		return m.sendFn(ctx, payload)
@@ -163,61 +89,6 @@ func TestConnReadBuffersMessage(t *testing.T) {
 
 	if atomic.LoadInt32(&recvCalls) != 1 {
 		t.Fatalf("expected 1 recv call, got %d", recvCalls)
-	}
-}
-
-func TestConnReadFromFramePath(t *testing.T) {
-	m := &mockFrameMessageConn{
-		frames: []mockFrame{
-			{payload: []byte("hello"), total: 11, offset: 0},
-			{payload: []byte(" "), total: 11, offset: 5},
-			{payload: []byte("world"), total: 11, offset: 6},
-		},
-	}
-	c := NewConn(m)
-
-	out := make([]byte, 0, 11)
-	buf := make([]byte, 2)
-	for len(out) < 11 {
-		n, err := c.Read(buf)
-		if err != nil {
-			t.Fatalf("read failed: %v", err)
-		}
-		out = append(out, buf[:n]...)
-	}
-
-	if got := string(out); got != "hello world" {
-		t.Fatalf("unexpected output %q", got)
-	}
-	if got := atomic.LoadInt32(&m.recvMsgCalls); got != 0 {
-		t.Fatalf("expected RecvMessage unused, got %d calls", got)
-	}
-	if got := atomic.LoadInt32(&m.repostCalls); got != 3 {
-		t.Fatalf("expected repost calls=3, got %d", got)
-	}
-}
-
-func TestConnReadFromFramePathDetectsOffsetMismatch(t *testing.T) {
-	m := &mockFrameMessageConn{
-		frames: []mockFrame{
-			{payload: []byte("abc"), total: 5, offset: 0},
-			{payload: []byte("de"), total: 5, offset: 4},
-		},
-	}
-	c := NewConn(m)
-
-	buf := make([]byte, 8)
-	n, err := c.Read(buf)
-	if err != nil {
-		t.Fatalf("first read failed: %v", err)
-	}
-	if got := string(buf[:n]); got != "abc" {
-		t.Fatalf("first read got %q", got)
-	}
-
-	_, err = c.Read(buf)
-	if err == nil {
-		t.Fatalf("expected offset mismatch error")
 	}
 }
 
@@ -313,25 +184,23 @@ func TestConnWriteDeadline(t *testing.T) {
 	}
 }
 
-func TestConnWriteUsesDefaultTimeoutWhenNoDeadline(t *testing.T) {
-	old := defaultWriteTimeout
-	defaultWriteTimeout = 30 * time.Millisecond
-	defer func() { defaultWriteTimeout = old }()
-
+func TestConnWriteNoDeadlineUsesBackgroundContext(t *testing.T) {
 	c := NewConn(&mockMessageConn{
 		sendFn: func(ctx context.Context, payload []byte) error {
-			<-ctx.Done()
-			return ctx.Err()
+			if _, ok := ctx.Deadline(); ok {
+				t.Fatalf("expected no write deadline in context")
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatalf("expected background context, got canceled: %v", ctx.Err())
+			default:
+			}
+			return nil
 		},
 	})
 
-	start := time.Now()
-	_, err := c.Write([]byte("x"))
-	if !errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("expected deadline exceeded, got %v", err)
-	}
-	if took := time.Since(start); took > 500*time.Millisecond {
-		t.Fatalf("write took too long: %s", took)
+	if _, err := c.Write([]byte("x")); err != nil {
+		t.Fatalf("write failed: %v", err)
 	}
 }
 
