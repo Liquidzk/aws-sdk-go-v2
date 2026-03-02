@@ -31,6 +31,13 @@ type MessageConn interface {
 	RemoteAddr() net.Addr
 }
 
+// messageFrameReposter is an optional capability for MessageConn
+// implementations that can explicitly repost a borrowed receive frame once the
+// consumer is done with it.
+type messageFrameReposter interface {
+	RepostFrame() error
+}
+
 // Conn adapts a MessageConn into net.Conn semantics so it can be used by
 // net/http transports.
 type Conn struct {
@@ -85,6 +92,12 @@ func (c *Conn) Read(p []byte) (int, error) {
 	c.readBuf = c.readBuf[n:]
 	if len(c.readBuf) == 0 {
 		c.readBuf = nil
+		if reposter, ok := c.stream.(messageFrameReposter); ok {
+			// Best-effort early repost once user-space buffer has fully consumed
+			// the borrowed frame, so recv depth is restored without waiting for
+			// the next RecvMessage call.
+			_ = reposter.RepostFrame()
+		}
 	}
 
 	return n, nil

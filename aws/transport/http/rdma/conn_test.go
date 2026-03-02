@@ -18,11 +18,12 @@ func (a mockAddr) Network() string { return "rdma" }
 func (a mockAddr) String() string  { return string(a) }
 
 type mockMessageConn struct {
-	sendFn  func(ctx context.Context, payload []byte) error
-	recvFn  func(ctx context.Context) ([]byte, error)
-	closeFn func() error
-	local   net.Addr
-	remote  net.Addr
+	sendFn   func(ctx context.Context, payload []byte) error
+	recvFn   func(ctx context.Context) ([]byte, error)
+	closeFn  func() error
+	repostFn func() error
+	local    net.Addr
+	remote   net.Addr
 }
 
 func (m *mockMessageConn) SendMessage(ctx context.Context, payload []byte) error {
@@ -42,6 +43,13 @@ func (m *mockMessageConn) RecvMessage(ctx context.Context) ([]byte, error) {
 func (m *mockMessageConn) Close() error {
 	if m.closeFn != nil {
 		return m.closeFn()
+	}
+	return nil
+}
+
+func (m *mockMessageConn) RepostFrame() error {
+	if m.repostFn != nil {
+		return m.repostFn()
 	}
 	return nil
 }
@@ -89,6 +97,47 @@ func TestConnReadBuffersMessage(t *testing.T) {
 
 	if atomic.LoadInt32(&recvCalls) != 1 {
 		t.Fatalf("expected 1 recv call, got %d", recvCalls)
+	}
+}
+
+func TestConnReadRepostsFrameAfterMessageConsumed(t *testing.T) {
+	var recvCalls int32
+	var repostCalls int32
+	c := NewConn(&mockMessageConn{
+		recvFn: func(ctx context.Context) ([]byte, error) {
+			if atomic.AddInt32(&recvCalls, 1) == 1 {
+				return []byte("hello"), nil
+			}
+			return nil, io.EOF
+		},
+		repostFn: func() error {
+			atomic.AddInt32(&repostCalls, 1)
+			return nil
+		},
+	})
+
+	buf := make([]byte, 2)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatalf("read 1 failed: %v", err)
+	}
+	if got := string(buf[:n]); got != "he" {
+		t.Fatalf("read 1 got %q", got)
+	}
+	if atomic.LoadInt32(&repostCalls) != 0 {
+		t.Fatalf("unexpected repost before message fully consumed")
+	}
+
+	buf2 := make([]byte, 8)
+	n, err = c.Read(buf2)
+	if err != nil {
+		t.Fatalf("read 2 failed: %v", err)
+	}
+	if got := string(buf2[:n]); got != "llo" {
+		t.Fatalf("read 2 got %q", got)
+	}
+	if atomic.LoadInt32(&repostCalls) != 1 {
+		t.Fatalf("expected repost after message consumed, got %d", repostCalls)
 	}
 }
 
