@@ -1307,6 +1307,128 @@ static int go_rdma_send_message(
 	return 0;
 }
 
+static int go_rdma_send_message_parts(
+	go_rdma_conn *conn,
+	const uint8_t *prefix,
+	uint32_t prefix_len,
+	const uint8_t *payload,
+	uint32_t payload_len,
+	int timeout_ms,
+	char **err_out
+) {
+	if (conn == NULL || conn->id == NULL) {
+		go_rdma_set_err(err_out, "go_rdma_send_message_parts: conn closed");
+		return EBADF;
+	}
+	if (prefix_len > 0 && prefix == NULL) {
+		go_rdma_set_err(err_out, "go_rdma_send_message_parts: prefix is nil");
+		return EINVAL;
+	}
+	if (payload_len > 0 && payload == NULL) {
+		go_rdma_set_err(err_out, "go_rdma_send_message_parts: payload is nil");
+		return EINVAL;
+	}
+
+	uint64_t total64 = (uint64_t)prefix_len + (uint64_t)payload_len;
+	if (total64 == 0) {
+		return 0;
+	}
+	if (total64 > UINT32_MAX) {
+		go_rdma_set_err(err_out, "go_rdma_send_message_parts: message too large");
+		return EINVAL;
+	}
+
+	uint32_t total_len = (uint32_t)total64;
+	uint32_t payload_cap = conn->frame_cap;
+	if (payload_cap == 0) {
+		go_rdma_set_err(err_out, "go_rdma_send_message_parts: invalid payload capacity");
+		return EINVAL;
+	}
+
+	uint32_t offset = 0;
+	while (offset < total_len) {
+		uint32_t remaining = total_len - offset;
+		uint32_t chunk_len = payload_cap;
+		if (chunk_len > remaining) {
+			chunk_len = remaining;
+		}
+
+		int rc = go_rdma_wait_local_send_slot(conn, timeout_ms, err_out);
+		if (rc != 0) {
+			return rc;
+		}
+
+		uint32_t local_slot = conn->tx_prod % conn->send_depth;
+		uint8_t *local_buf = conn->send_buf + ((size_t)local_slot * conn->frame_cap);
+
+		uint32_t copied = 0;
+		if (offset < prefix_len) {
+			uint32_t prefix_rem = prefix_len - offset;
+			uint32_t take = chunk_len;
+			if (take > prefix_rem) {
+				take = prefix_rem;
+			}
+			memcpy(local_buf, prefix + offset, take);
+			copied = take;
+		}
+		if (copied < chunk_len) {
+			uint32_t payload_off = offset + copied - prefix_len;
+			uint32_t payload_take = chunk_len - copied;
+			memcpy(local_buf + copied, payload + payload_off, payload_take);
+		}
+
+		struct ibv_sge sge;
+		memset(&sge, 0, sizeof(sge));
+		sge.addr = (uintptr_t)local_buf;
+		sge.length = chunk_len;
+		sge.lkey = conn->send_mr->lkey;
+
+		struct ibv_send_wr wr;
+		memset(&wr, 0, sizeof(wr));
+		wr.wr_id = (uintptr_t)conn->tx_prod;
+		wr.sg_list = &sge;
+		wr.num_sge = 1;
+		wr.opcode = IBV_WR_SEND;
+		wr.send_flags = 0;
+
+		int send_flags = 0;
+		uint32_t outstanding = conn->tx_prod - conn->send_completed;
+		int need_signal = 0;
+		if (conn->send_signal_interval <= 1) {
+			need_signal = 1;
+		} else if (((conn->tx_prod + 1) % conn->send_signal_interval) == 0) {
+			need_signal = 1;
+		} else if ((outstanding + 1) >= conn->send_depth) {
+			// Always keep at least one signaled WQE to guarantee progress.
+			need_signal = 1;
+		}
+		if (offset + chunk_len >= total_len) {
+			need_signal = 1;
+		}
+		if (need_signal) {
+			send_flags |= IBV_SEND_SIGNALED;
+		}
+		if (conn->inline_threshold > 0 && chunk_len <= conn->inline_threshold) {
+			send_flags |= IBV_SEND_INLINE;
+		}
+		wr.send_flags = send_flags;
+
+		struct ibv_send_wr *bad_wr = NULL;
+		rc = ibv_post_send(conn->id->qp, &wr, &bad_wr);
+		if (rc != 0) {
+			go_rdma_set_errno(err_out, "ibv_post_send(send_data_parts)");
+			return errno != 0 ? errno : EIO;
+		}
+
+		conn->tx_prod++;
+		offset += chunk_len;
+	}
+
+	// Do not flush on every message. Keep send path asynchronous and rely on
+	// queue-depth pressure to reap completions when needed.
+	return 0;
+}
+
 static int go_rdma_release_last_recv_slot(
 	go_rdma_conn *conn,
 	char **err_out
@@ -1452,6 +1574,13 @@ type verbsMessageConn struct {
 
 var _ MessageConn = (*verbsMessageConn)(nil)
 
+// RecvMessage payload points to reusable RDMA receive slots and is unstable
+// across subsequent receives on the same connection.
+func (c *verbsMessageConn) RecvPayloadStable() bool {
+	_ = c
+	return false
+}
+
 type verbsListener struct {
 	mu sync.RWMutex
 	cl *C.go_rdma_listener
@@ -1473,6 +1602,9 @@ func newVerbsListener(network, address string, opts VerbsListenerOptions) (net.L
 	cfg, err := opts.VerbsOptions.normalize()
 	if err != nil {
 		return nil, err
+	}
+	if opts.MultiplexSendQueueDepth < 0 {
+		return nil, fmt.Errorf("rdma verbs: multiplex send queue depth must be >= 0")
 	}
 
 	host, port, err := splitHostPortListenAddress(network, address)
@@ -1540,6 +1672,9 @@ func newVerbsListener(network, address string, opts VerbsListenerOptions) (net.L
 		done:             make(chan struct{}),
 	}
 	l.startAcceptWorkers()
+	if opts.EnableMultiplex {
+		return newEndpointMuxListener(l, opts.MultiplexSendQueueDepth), nil
+	}
 	return l, nil
 }
 
@@ -1560,7 +1695,7 @@ func splitHostPortListenAddress(network, address string) (host string, port stri
 	return host, port, nil
 }
 
-func (l *verbsListener) Accept() (net.Conn, error) {
+func (l *verbsListener) AcceptMessage() (MessageConn, error) {
 	l.mu.RLock()
 	framePayloadSize := l.framePayloadSize
 	localAddr := l.localAddr
@@ -1582,8 +1717,16 @@ func (l *verbsListener) Accept() (net.Conn, error) {
 			remoteAddr:       rdmaAddr{network: "rdma", address: "remote"},
 			ready:            true,
 		}
-		return NewConn(msgConn), nil
+		return msgConn, nil
 	}
+}
+
+func (l *verbsListener) Accept() (net.Conn, error) {
+	msgConn, err := l.AcceptMessage()
+	if err != nil {
+		return nil, err
+	}
+	return NewConn(msgConn), nil
 }
 
 func (l *verbsListener) Close() error {
@@ -1894,6 +2037,57 @@ func (c *verbsMessageConn) SendMessage(ctx context.Context, payload []byte) erro
 			return context.DeadlineExceeded
 		}
 		return rdmaCError("send", rc, cErr)
+	}
+	return nil
+}
+
+func (c *verbsMessageConn) SendMessageParts(ctx context.Context, prefix []byte, payload []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.cc == nil {
+		return net.ErrClosed
+	}
+	if err := c.ensureReady(ctx); err != nil {
+		return err
+	}
+	timeoutMS, err := rdmaContextTimeoutMillis(ctx)
+	if err != nil {
+		return err
+	}
+
+	var prefixPtr *C.uint8_t
+	if len(prefix) > 0 {
+		prefixPtr = (*C.uint8_t)(unsafe.Pointer(&prefix[0]))
+	}
+	var payloadPtr *C.uint8_t
+	if len(payload) > 0 {
+		payloadPtr = (*C.uint8_t)(unsafe.Pointer(&payload[0]))
+	}
+
+	var cErr *C.char
+	rc := C.go_rdma_send_message_parts(
+		c.cc,
+		prefixPtr,
+		C.uint32_t(len(prefix)),
+		payloadPtr,
+		C.uint32_t(len(payload)),
+		timeoutMS,
+		&cErr,
+	)
+	runtime.KeepAlive(prefix)
+	runtime.KeepAlive(payload)
+	if rc != 0 {
+		if rc == C.int(C.EAGAIN) {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return context.DeadlineExceeded
+		}
+		return rdmaCError("send_parts", rc, cErr)
 	}
 	return nil
 }

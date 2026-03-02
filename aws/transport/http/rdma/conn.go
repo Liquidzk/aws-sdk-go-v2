@@ -31,6 +31,19 @@ type MessageConn interface {
 	RemoteAddr() net.Addr
 }
 
+// messageConnPartSender is an optional fast-path for sending one logical
+// message from two byte-slices without pre-concatenating them.
+type messageConnPartSender interface {
+	SendMessageParts(ctx context.Context, prefix []byte, payload []byte) error
+}
+
+// messageConnRecvPayloadStability reports whether RecvMessage payload bytes stay
+// valid after the next RecvMessage call. When false, upper layers must copy
+// payload bytes before issuing another receive on the same MessageConn.
+type messageConnRecvPayloadStability interface {
+	RecvPayloadStable() bool
+}
+
 // Conn adapts a MessageConn into net.Conn semantics so it can be used by
 // net/http transports.
 type Conn struct {

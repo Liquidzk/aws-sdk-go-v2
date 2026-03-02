@@ -384,6 +384,134 @@ func TestDialerOpenMinInterval(t *testing.T) {
 	}
 }
 
+func TestDialerEndpointEngineReusesPhysicalConnection(t *testing.T) {
+	var openCalls int32
+	var closeCalls int32
+
+	d := NewVerbsDialer(VerbsOptions{
+		EndpointPoolSize: 1,
+	})
+	d.Open = func(ctx context.Context, network, address string) (MessageConn, error) {
+		atomic.AddInt32(&openCalls, 1)
+		return &mockMessageConn{
+			closeFn: func() error {
+				atomic.AddInt32(&closeCalls, 1)
+				return nil
+			},
+		}, nil
+	}
+	d.DisableFallback = true
+
+	for i := 0; i < 5; i++ {
+		conn, err := d.DialContext(context.Background(), "tcp", "example:1")
+		if err != nil {
+			t.Fatalf("dial %d failed: %v", i, err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatalf("close %d failed: %v", i, err)
+		}
+	}
+
+	if e, a := int32(1), atomic.LoadInt32(&openCalls); e != a {
+		t.Fatalf("open calls=%d, want %d", a, e)
+	}
+	if e, a := int32(0), atomic.LoadInt32(&closeCalls); e != a {
+		t.Fatalf("close calls=%d, want %d", a, e)
+	}
+}
+
+func TestDialerEndpointEnginePoolLimit(t *testing.T) {
+	var openCalls int32
+
+	d := NewVerbsDialer(VerbsOptions{
+		EndpointPoolSize: 2,
+	})
+	d.Open = func(ctx context.Context, network, address string) (MessageConn, error) {
+		atomic.AddInt32(&openCalls, 1)
+		return &mockMessageConn{}, nil
+	}
+	d.DisableFallback = true
+
+	conn1, err := d.DialContext(context.Background(), "tcp", "example:1")
+	if err != nil {
+		t.Fatalf("dial conn1 failed: %v", err)
+	}
+	defer conn1.Close()
+
+	conn2, err := d.DialContext(context.Background(), "tcp", "example:1")
+	if err != nil {
+		t.Fatalf("dial conn2 failed: %v", err)
+	}
+	defer conn2.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err = d.DialContext(ctx, "tcp", "example:1")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+
+	if e, a := int32(2), atomic.LoadInt32(&openCalls); e != a {
+		t.Fatalf("open calls=%d, want %d", a, e)
+	}
+
+	if err := conn1.Close(); err != nil {
+		t.Fatalf("close conn1 failed: %v", err)
+	}
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel2()
+	conn3, err := d.DialContext(ctx2, "tcp", "example:1")
+	if err != nil {
+		t.Fatalf("expected dial to succeed after release, got %v", err)
+	}
+	_ = conn3.Close()
+}
+
+func TestDialerEndpointEngineSharedMemoryBudget(t *testing.T) {
+	var openCalls int32
+
+	d := NewVerbsDialer(VerbsOptions{
+		EndpointPoolSize:        2,
+		SharedMemoryBudgetBytes: 1024,
+		FramePayloadSize:        128,
+		SendQueueDepth:          4,
+		RecvQueueDepth:          4, // estimatedConnBytes = 1024
+	})
+	d.Open = func(ctx context.Context, network, address string) (MessageConn, error) {
+		atomic.AddInt32(&openCalls, 1)
+		return &mockMessageConn{}, nil
+	}
+	d.DisableFallback = true
+
+	conn1, err := d.DialContext(context.Background(), "tcp", "example:1")
+	if err != nil {
+		t.Fatalf("dial conn1 failed: %v", err)
+	}
+	defer conn1.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err = d.DialContext(ctx, "tcp", "example:1")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded under memory budget, got %v", err)
+	}
+
+	if e, a := int32(1), atomic.LoadInt32(&openCalls); e != a {
+		t.Fatalf("open calls=%d, want %d", a, e)
+	}
+
+	if err := conn1.Close(); err != nil {
+		t.Fatalf("close conn1 failed: %v", err)
+	}
+
+	conn2, err := d.DialContext(context.Background(), "tcp", "example:1")
+	if err != nil {
+		t.Fatalf("dial conn2 failed: %v", err)
+	}
+	_ = conn2.Close()
+}
+
 func TestConnNilStreamReturnsErrClosed(t *testing.T) {
 	c := NewConn(nil)
 

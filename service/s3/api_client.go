@@ -36,7 +36,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -48,6 +51,19 @@ const (
 	awsS3EnableRDMATransportEnv = "AWS_S3_RDMA_ENABLED"
 	awsS3DisableRDMAFallbackEnv = "AWS_S3_RDMA_DISABLE_FALLBACK"
 )
+
+const (
+	rdmaAdaptiveMinConnsPerHost = 4
+	rdmaAdaptiveMaxConnsPerHost = 128
+	rdmaAdaptiveConnsPerCPU     = 2
+)
+
+var sharedS3HTTPConnectionPools = struct {
+	mu      sync.Mutex
+	clients map[string]HTTPClient
+}{
+	clients: map[string]HTTPClient{},
+}
 
 type operationMetrics struct {
 	Duration                metrics.Float64Histogram
@@ -544,6 +560,7 @@ func resolveHTTPClient(o *Options) {
 	}
 
 	buildable = resolveRDMATransportDialer(o, buildable)
+	buildable = resolveRDMATransportPool(o, buildable)
 
 	o.HTTPClient = buildable
 }
@@ -561,13 +578,94 @@ func resolveRDMATransportDialer(o *Options, buildable *awshttp.BuildableClient) 
 	return buildable.WithDialContext(dialer.DialContext)
 }
 
+func resolveRDMATransportPool(o *Options, buildable *awshttp.BuildableClient) *awshttp.BuildableClient {
+	if !isRDMATransportEnabled(o) {
+		return buildable
+	}
+
+	maxConnsPerHost := resolveRDMAMaxConnsPerHost(o)
+
+	return buildable.WithTransportOptions(func(transport *http.Transport) {
+		transport.MaxConnsPerHost = maxConnsPerHost
+		transport.MaxIdleConnsPerHost = maxConnsPerHost
+		if transport.MaxIdleConns < maxConnsPerHost {
+			transport.MaxIdleConns = maxConnsPerHost
+		}
+	})
+}
+
+func resolveRDMAMaxConnsPerHost(o *Options) int {
+	if o.RDMAMaxConnsPerHost > 0 {
+		return o.RDMAMaxConnsPerHost
+	}
+	return defaultAdaptiveRDMAMaxConnsPerHost()
+}
+
+func defaultAdaptiveRDMAMaxConnsPerHost() int {
+	maxConns := runtime.GOMAXPROCS(0) * rdmaAdaptiveConnsPerCPU
+	if maxConns < rdmaAdaptiveMinConnsPerHost {
+		maxConns = rdmaAdaptiveMinConnsPerHost
+	}
+	if maxConns > rdmaAdaptiveMaxConnsPerHost {
+		maxConns = rdmaAdaptiveMaxConnsPerHost
+	}
+	if maxConns > awshttp.DefaultHTTPTransportMaxConnsPerHost {
+		maxConns = awshttp.DefaultHTTPTransportMaxConnsPerHost
+	}
+	return maxConns
+}
+
+func resolveSharedHTTPConnectionPoolKey(o *Options) string {
+	if key := strings.TrimSpace(o.SharedHTTPConnectionPoolKey); key != "" {
+		return key
+	}
+
+	baseEndpoint := ""
+	if o.BaseEndpoint != nil {
+		baseEndpoint = strings.TrimSpace(*o.BaseEndpoint)
+	}
+	return fmt.Sprintf(
+		"s3|region=%s|endpoint=%s|rdma=%t|max_conns=%d",
+		o.Region,
+		baseEndpoint,
+		isRDMATransportEnabled(o),
+		resolveRDMAMaxConnsPerHost(o),
+	)
+}
+
+func resolveSharedHTTPConnectionPool(o *Options, buildable *awshttp.BuildableClient) HTTPClient {
+	if !o.EnableSharedHTTPConnectionPool {
+		return buildable
+	}
+
+	key := resolveSharedHTTPConnectionPoolKey(o)
+	sharedS3HTTPConnectionPools.mu.Lock()
+	defer sharedS3HTTPConnectionPools.mu.Unlock()
+
+	if client, ok := sharedS3HTTPConnectionPools.clients[key]; ok {
+		return client
+	}
+
+	client := buildable.Freeze()
+	sharedS3HTTPConnectionPools.clients[key] = client
+	return client
+}
+
+func resetSharedHTTPConnectionPoolsForTest() {
+	sharedS3HTTPConnectionPools.mu.Lock()
+	sharedS3HTTPConnectionPools.clients = map[string]HTTPClient{}
+	sharedS3HTTPConnectionPools.mu.Unlock()
+}
+
 func finalizeRDMATransportHTTPClient(o *Options) {
 	buildable, ok := o.HTTPClient.(*awshttp.BuildableClient)
 	if !ok {
 		return
 	}
 
-	o.HTTPClient = resolveRDMATransportDialer(o, buildable)
+	buildable = resolveRDMATransportDialer(o, buildable)
+	buildable = resolveRDMATransportPool(o, buildable)
+	o.HTTPClient = resolveSharedHTTPConnectionPool(o, buildable)
 }
 
 func isRDMATransportEnabled(o *Options) bool {

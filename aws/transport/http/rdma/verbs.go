@@ -3,6 +3,7 @@ package rdma
 import (
 	"fmt"
 	"net"
+	"time"
 )
 
 const (
@@ -53,15 +54,51 @@ type VerbsOptions struct {
 	// 1 means every frame; larger values reduce completion overhead.
 	// A value of 0 uses defaults (depends on LowCPU).
 	SendSignalInterval int
+
+	// EndpointPoolSize limits number of physical connections opened per endpoint.
+	// Values <= 0 disable endpoint engine pooling.
+	EndpointPoolSize int
+
+	// EndpointPoolWarmup pre-opens EndpointPoolSize physical connections in
+	// background when endpoint engine pooling is enabled.
+	EndpointPoolWarmup bool
+
+	// EndpointAcquireTimeout bounds waiting for pooled connections when
+	// EndpointPoolSize is reached.
+	EndpointAcquireTimeout time.Duration
+
+	// SharedMemoryBudgetBytes enables memory-budget accounting for pooled
+	// physical RDMA connections. Values <= 0 disable budget enforcement.
+	SharedMemoryBudgetBytes int
+
+	// EndpointEnableMultiplex enables logical stream multiplexing over pooled
+	// physical RDMA endpoint connections.
+	EndpointEnableMultiplex bool
+
+	// EndpointSendQueueDepth controls buffered frame queue depth per physical
+	// multiplexed connection. Values <= 0 use defaults.
+	EndpointSendQueueDepth int
 }
 
 // NewVerbsDialer creates a Dialer that opens connections through RDMA verbs.
 func NewVerbsDialer(opts VerbsOptions) Dialer {
+	estimatedConnBytes := estimateVerbsConnBytes(opts)
 	return Dialer{
 		Open:            opts.Open,
 		OpenParallelism: DefaultOpenParallelism,
 		OpenMinInterval: DefaultOpenMinInterval,
-		state:           &dialerState{},
+		EndpointEngine: EndpointEngineOptions{
+			PoolSize:        opts.EndpointPoolSize,
+			Warmup:          opts.EndpointPoolWarmup,
+			AcquireTimeout:  opts.EndpointAcquireTimeout,
+			EnableMultiplex: opts.EndpointEnableMultiplex,
+			SendQueueDepth:  opts.EndpointSendQueueDepth,
+		},
+		SharedMemoryBudget: SharedMemoryBudgetOptions{
+			TotalBytes:         opts.SharedMemoryBudgetBytes,
+			EstimatedConnBytes: estimatedConnBytes,
+		},
+		state: &dialerState{},
 	}
 }
 
@@ -99,6 +136,18 @@ func (o VerbsOptions) normalize() (verbsConfig, error) {
 	if o.SendSignalInterval < 0 {
 		return verbsConfig{}, fmt.Errorf("rdma verbs: send signal interval must be >= 0")
 	}
+	if o.EndpointPoolSize < 0 {
+		return verbsConfig{}, fmt.Errorf("rdma verbs: endpoint pool size must be >= 0")
+	}
+	if o.EndpointAcquireTimeout < 0 {
+		return verbsConfig{}, fmt.Errorf("rdma verbs: endpoint acquire timeout must be >= 0")
+	}
+	if o.SharedMemoryBudgetBytes < 0 {
+		return verbsConfig{}, fmt.Errorf("rdma verbs: shared memory budget bytes must be >= 0")
+	}
+	if o.EndpointSendQueueDepth < 0 {
+		return verbsConfig{}, fmt.Errorf("rdma verbs: endpoint send queue depth must be >= 0")
+	}
 
 	if o.FramePayloadSize > 0 {
 		cfg.framePayloadSize = o.FramePayloadSize
@@ -120,6 +169,31 @@ func (o VerbsOptions) normalize() (verbsConfig, error) {
 	}
 
 	return cfg, nil
+}
+
+func estimateVerbsConnBytes(o VerbsOptions) int {
+	framePayloadSize := DefaultVerbsFramePayloadSize
+	sendQueueDepth := DefaultVerbsSendQueueDepth
+	recvQueueDepth := DefaultVerbsRecvQueueDepth
+
+	if o.FramePayloadSize > 0 {
+		framePayloadSize = o.FramePayloadSize
+	}
+	if o.SendQueueDepth > 0 {
+		sendQueueDepth = o.SendQueueDepth
+	}
+	if o.RecvQueueDepth > 0 {
+		recvQueueDepth = o.RecvQueueDepth
+	}
+	if framePayloadSize <= 0 || sendQueueDepth < 0 || recvQueueDepth < 0 {
+		return 0
+	}
+
+	totalDepth := sendQueueDepth + recvQueueDepth
+	if totalDepth <= 0 {
+		return 0
+	}
+	return framePayloadSize * totalDepth
 }
 
 func splitHostPortAddress(network, address string) (host string, port string, err error) {

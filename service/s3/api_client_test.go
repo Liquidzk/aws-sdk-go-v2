@@ -340,3 +340,85 @@ func TestClient_resolveHTTPClient_RDMATransportFromOptFns(t *testing.T) {
 		t.Fatalf("expected fallback dial to be called from optFns configuration")
 	}
 }
+
+func TestClient_resolveHTTPClient_RDMATransportMaxConnsPerHostFixed(t *testing.T) {
+	client := New(Options{
+		Region:              "us-west-2",
+		EnableRDMATransport: true,
+		RDMAMaxConnsPerHost: 7,
+	})
+
+	buildable, ok := client.options.HTTPClient.(*awshttp.BuildableClient)
+	if !ok {
+		t.Fatalf("expected *awshttp.BuildableClient, got %T", client.options.HTTPClient)
+	}
+
+	tr := buildable.GetTransport()
+	if e, a := 7, tr.MaxConnsPerHost; e != a {
+		t.Fatalf("expected max conns per host=%d, got %d", e, a)
+	}
+	if e, a := 7, tr.MaxIdleConnsPerHost; e != a {
+		t.Fatalf("expected max idle conns per host=%d, got %d", e, a)
+	}
+	if tr.MaxIdleConns < 7 {
+		t.Fatalf("expected max idle conns >= 7, got %d", tr.MaxIdleConns)
+	}
+}
+
+func TestClient_resolveHTTPClient_RDMATransportMaxConnsPerHostAdaptive(t *testing.T) {
+	client := New(Options{
+		Region:              "us-west-2",
+		EnableRDMATransport: true,
+	})
+
+	buildable, ok := client.options.HTTPClient.(*awshttp.BuildableClient)
+	if !ok {
+		t.Fatalf("expected *awshttp.BuildableClient, got %T", client.options.HTTPClient)
+	}
+
+	expected := defaultAdaptiveRDMAMaxConnsPerHost()
+	tr := buildable.GetTransport()
+	if e, a := expected, tr.MaxConnsPerHost; e != a {
+		t.Fatalf("expected adaptive max conns per host=%d, got %d", e, a)
+	}
+	if e, a := expected, tr.MaxIdleConnsPerHost; e != a {
+		t.Fatalf("expected adaptive max idle conns per host=%d, got %d", e, a)
+	}
+}
+
+func TestClient_resolveHTTPClient_SharedHTTPConnectionPool(t *testing.T) {
+	resetSharedHTTPConnectionPoolsForTest()
+	t.Cleanup(resetSharedHTTPConnectionPoolsForTest)
+
+	client1 := New(Options{
+		Region:                         "us-west-2",
+		EnableRDMATransport:            true,
+		EnableSharedHTTPConnectionPool: true,
+		SharedHTTPConnectionPoolKey:    "pool-a",
+		RDMAMaxConnsPerHost:            5,
+	})
+	client2 := New(Options{
+		Region:                         "us-west-2",
+		EnableRDMATransport:            true,
+		EnableSharedHTTPConnectionPool: true,
+		SharedHTTPConnectionPoolKey:    "pool-a",
+		RDMAMaxConnsPerHost:            5,
+	})
+	client3 := New(Options{
+		Region:                         "us-west-2",
+		EnableRDMATransport:            true,
+		EnableSharedHTTPConnectionPool: true,
+		SharedHTTPConnectionPoolKey:    "pool-b",
+		RDMAMaxConnsPerHost:            5,
+	})
+
+	if _, ok := client1.options.HTTPClient.(*awshttp.BuildableClient); ok {
+		t.Fatalf("expected shared HTTP pool to freeze buildable client")
+	}
+	if client1.options.HTTPClient != client2.options.HTTPClient {
+		t.Fatalf("expected clients with same pool key to reuse one HTTP client")
+	}
+	if client1.options.HTTPClient == client3.options.HTTPClient {
+		t.Fatalf("expected clients with different pool keys to use different HTTP clients")
+	}
+}

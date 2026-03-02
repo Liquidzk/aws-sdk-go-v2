@@ -186,6 +186,23 @@ type Options struct {
 	// [RDMADialer.Open] is set.
 	RDMADialer awsrdmahttp.Dialer
 
+	// Enables sharing one HTTP connection pool across multiple S3 clients.
+	//
+	// When true, clients with the same [SharedHTTPConnectionPoolKey] will reuse
+	// one underlying HTTP client/transport pool.
+	EnableSharedHTTPConnectionPool bool
+
+	// Identifies which shared HTTP connection pool group this client should use
+	// when [EnableSharedHTTPConnectionPool] is true.
+	//
+	// If empty, the SDK derives a key from endpoint/region/RDMA pool settings.
+	SharedHTTPConnectionPoolKey string
+
+	// Sets the maximum concurrent connections per host used by RDMA transport.
+	//
+	// Values > 0 use a fixed limit. Values <= 0 use an adaptive default.
+	RDMAMaxConnsPerHost int
+
 	// The HTTP client to invoke API calls with. Defaults to client's default HTTP
 	// implementation if nil.
 	HTTPClient HTTPClient
@@ -274,6 +291,30 @@ func WithRDMADialer(v awsrdmahttp.Dialer) func(*Options) {
 		if v.Open != nil {
 			o.EnableRDMATransport = true
 		}
+	}
+}
+
+// WithEnableSharedHTTPConnectionPool returns a functional option for enabling
+// shared HTTP connection pooling across S3 clients.
+func WithEnableSharedHTTPConnectionPool(v bool) func(*Options) {
+	return func(o *Options) {
+		o.EnableSharedHTTPConnectionPool = v
+	}
+}
+
+// WithSharedHTTPConnectionPoolKey returns a functional option for setting the
+// shared pool key used when shared HTTP connection pooling is enabled.
+func WithSharedHTTPConnectionPoolKey(v string) func(*Options) {
+	return func(o *Options) {
+		o.SharedHTTPConnectionPoolKey = v
+	}
+}
+
+// WithRDMAMaxConnsPerHost returns a functional option for setting the max
+// concurrent connections per host for RDMA transport.
+func WithRDMAMaxConnsPerHost(v int) func(*Options) {
+	return func(o *Options) {
+		o.RDMAMaxConnsPerHost = v
 	}
 }
 

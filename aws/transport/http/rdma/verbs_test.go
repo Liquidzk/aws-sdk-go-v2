@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestVerbsOptionsNormalizeDefaults(t *testing.T) {
@@ -36,6 +37,10 @@ func TestVerbsOptionsNormalizeValidation(t *testing.T) {
 		{RecvQueueDepth: -1},
 		{InlineThreshold: -2},
 		{SendSignalInterval: -1},
+		{EndpointPoolSize: -1},
+		{EndpointAcquireTimeout: -1 * time.Millisecond},
+		{SharedMemoryBudgetBytes: -1},
+		{EndpointSendQueueDepth: -1},
 	}
 
 	for i, tc := range cases {
@@ -104,5 +109,38 @@ func TestNewVerbsDialer(t *testing.T) {
 	d := NewVerbsDialer(VerbsOptions{})
 	if d.Open == nil {
 		t.Fatalf("expected Open to be configured")
+	}
+
+	d = NewVerbsDialer(VerbsOptions{
+		FramePayloadSize:        4096,
+		SendQueueDepth:          8,
+		RecvQueueDepth:          16,
+		EndpointPoolSize:        4,
+		EndpointPoolWarmup:      true,
+		EndpointAcquireTimeout:  25 * time.Millisecond,
+		SharedMemoryBudgetBytes: 1 << 20,
+		EndpointEnableMultiplex: true,
+		EndpointSendQueueDepth:  32,
+	})
+	if e, a := 4, d.EndpointEngine.PoolSize; e != a {
+		t.Fatalf("endpoint pool size = %d, want %d", a, e)
+	}
+	if !d.EndpointEngine.Warmup {
+		t.Fatalf("expected endpoint warmup to be enabled")
+	}
+	if e, a := 25*time.Millisecond, d.EndpointEngine.AcquireTimeout; e != a {
+		t.Fatalf("endpoint acquire timeout = %v, want %v", a, e)
+	}
+	if !d.EndpointEngine.EnableMultiplex {
+		t.Fatalf("expected endpoint multiplex to be enabled")
+	}
+	if e, a := 32, d.EndpointEngine.SendQueueDepth; e != a {
+		t.Fatalf("endpoint send queue depth = %d, want %d", a, e)
+	}
+	if e, a := 1<<20, d.SharedMemoryBudget.TotalBytes; e != a {
+		t.Fatalf("shared budget bytes = %d, want %d", a, e)
+	}
+	if e, a := 4096*(8+16), d.SharedMemoryBudget.EstimatedConnBytes; e != a {
+		t.Fatalf("estimated conn bytes = %d, want %d", a, e)
 	}
 }

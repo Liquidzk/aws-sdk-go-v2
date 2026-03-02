@@ -26,6 +26,48 @@ type dialerState struct {
 	mu       sync.Mutex
 	lastOpen time.Time
 	sem      chan struct{}
+
+	endpointEngines     map[string]*endpointEngine
+	endpointMuxEngines  map[string]*endpointMuxEngine
+	sharedMemoryBudget  *sharedMemoryBudget
+	sharedMemoryMaxByte int
+}
+
+// EndpointEngineOptions configures per-endpoint physical connection pooling.
+type EndpointEngineOptions struct {
+	// PoolSize limits number of physical RDMA connections opened per endpoint.
+	// Values <= 0 disable endpoint engine pooling.
+	PoolSize int
+
+	// Warmup pre-opens physical connections in the background up to PoolSize.
+	Warmup bool
+
+	// AcquireTimeout bounds waiting for an endpoint engine connection when
+	// PoolSize is reached.
+	AcquireTimeout time.Duration
+
+	// EnableMultiplex enables logical stream multiplexing over fixed physical
+	// endpoint connection pool.
+	EnableMultiplex bool
+
+	// SendQueueDepth sets buffered frame queue depth per physical connection for
+	// multiplexed sending. Values <= 0 use defaults.
+	SendQueueDepth int
+}
+
+// SharedMemoryBudgetOptions defines a dialer-local memory budget used by
+// endpoint engine pooled connections.
+//
+// This is a phase-1 budget model for controlling pooled RDMA footprint. It
+// does not yet implement cross-connection shared MR regions.
+type SharedMemoryBudgetOptions struct {
+	// TotalBytes is the maximum total bytes allowed for pooled physical
+	// connections. Values <= 0 disable budget enforcement.
+	TotalBytes int
+
+	// EstimatedConnBytes is the per-connection estimated bytes consumed by RDMA
+	// send/recv buffers for budget accounting. Values <= 0 disable accounting.
+	EstimatedConnBytes int
 }
 
 // Dialer bridges a message-oriented RDMA backend to net/http by exposing a
@@ -50,6 +92,13 @@ type Dialer struct {
 	// DefaultOpenMinInterval.
 	OpenMinInterval time.Duration
 
+	// EndpointEngine controls fixed-size physical connection pooling per
+	// endpoint.
+	EndpointEngine EndpointEngineOptions
+
+	// SharedMemoryBudget controls pooled-connection memory budgeting.
+	SharedMemoryBudget SharedMemoryBudgetOptions
+
 	state *dialerState
 }
 
@@ -59,17 +108,8 @@ func (d Dialer) DialContext(ctx context.Context, network, address string) (net.C
 		return d.fallbackDialContext()(ctx, network, address)
 	}
 
-	release, err := d.beforeOpen(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer release()
-
-	msgConn, openErr := d.Open(ctx, network, address)
+	msgConn, openErr := d.openMessageConnForDial(ctx, network, address)
 	if openErr == nil {
-		if msgConn == nil {
-			return nil, errors.New("rdma dialer open returned nil MessageConn")
-		}
 		return NewConn(msgConn), nil
 	}
 
@@ -83,6 +123,43 @@ func (d Dialer) DialContext(ctx context.Context, network, address string) (net.C
 	}
 
 	return nil, fmt.Errorf("rdma open failed: %w; fallback failed: %v", openErr, fallbackErr)
+}
+
+func (d Dialer) openMessageConnForDial(ctx context.Context, network, address string) (MessageConn, error) {
+	if d.EndpointEngine.PoolSize > 0 {
+		if d.EndpointEngine.EnableMultiplex {
+			engine, err := d.getEndpointMuxEngine(network, address)
+			if err != nil {
+				return nil, err
+			}
+			return engine.Acquire(ctx)
+		}
+
+		engine, err := d.getEndpointEngine(network, address)
+		if err != nil {
+			return nil, err
+		}
+		return engine.Acquire(ctx)
+	}
+
+	return d.openMessageConn(ctx, network, address)
+}
+
+func (d Dialer) openMessageConn(ctx context.Context, network, address string) (MessageConn, error) {
+	release, err := d.beforeOpen(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	msgConn, openErr := d.Open(ctx, network, address)
+	if openErr != nil {
+		return nil, openErr
+	}
+	if msgConn == nil {
+		return nil, errors.New("rdma dialer open returned nil MessageConn")
+	}
+	return msgConn, nil
 }
 
 func (d Dialer) fallbackDialContext() func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -112,6 +189,95 @@ func (d Dialer) getState() *dialerState {
 		return d.state
 	}
 	return &dialerState{}
+}
+
+func (d Dialer) getEndpointEngine(network, address string) (*endpointEngine, error) {
+	state := d.getState()
+	key := endpointEngineKey(network, address)
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if state.endpointEngines == nil {
+		state.endpointEngines = map[string]*endpointEngine{}
+	}
+	if eng, ok := state.endpointEngines[key]; ok {
+		return eng, nil
+	}
+
+	cfg := endpointEngineConfig{
+		key:            key,
+		network:        network,
+		address:        address,
+		poolSize:       d.EndpointEngine.PoolSize,
+		warmup:         d.EndpointEngine.Warmup,
+		acquireTimeout: d.EndpointEngine.AcquireTimeout,
+		open:           d.openMessageConn,
+	}
+
+	if b := state.getSharedMemoryBudgetLocked(d.SharedMemoryBudget.TotalBytes); b != nil {
+		cfg.memoryBudget = b
+		cfg.memoryPerConn = d.SharedMemoryBudget.EstimatedConnBytes
+	}
+
+	engine, err := newEndpointEngine(cfg)
+	if err != nil {
+		return nil, err
+	}
+	state.endpointEngines[key] = engine
+	return engine, nil
+}
+
+func (d Dialer) getEndpointMuxEngine(network, address string) (*endpointMuxEngine, error) {
+	state := d.getState()
+	key := endpointEngineKey(network, address)
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if state.endpointMuxEngines == nil {
+		state.endpointMuxEngines = map[string]*endpointMuxEngine{}
+	}
+	if eng, ok := state.endpointMuxEngines[key]; ok {
+		return eng, nil
+	}
+
+	cfg := endpointMuxEngineConfig{
+		key:            key,
+		network:        network,
+		address:        address,
+		poolSize:       d.EndpointEngine.PoolSize,
+		warmup:         d.EndpointEngine.Warmup,
+		acquireTimeout: d.EndpointEngine.AcquireTimeout,
+		sendQueueDepth: d.EndpointEngine.SendQueueDepth,
+		open:           d.openMessageConn,
+	}
+
+	if b := state.getSharedMemoryBudgetLocked(d.SharedMemoryBudget.TotalBytes); b != nil {
+		cfg.memoryBudget = b
+		cfg.memoryPerConn = d.SharedMemoryBudget.EstimatedConnBytes
+	}
+
+	engine, err := newEndpointMuxEngine(cfg)
+	if err != nil {
+		return nil, err
+	}
+	state.endpointMuxEngines[key] = engine
+	return engine, nil
+}
+
+func (s *dialerState) getSharedMemoryBudgetLocked(totalBytes int) *sharedMemoryBudget {
+	if totalBytes <= 0 {
+		return nil
+	}
+
+	if s.sharedMemoryBudget != nil && s.sharedMemoryMaxByte == totalBytes {
+		return s.sharedMemoryBudget
+	}
+
+	s.sharedMemoryBudget = newSharedMemoryBudget(totalBytes)
+	s.sharedMemoryMaxByte = totalBytes
+	return s.sharedMemoryBudget
 }
 
 func (s *dialerState) acquirePermit(ctx context.Context, parallelism int) (func(), error) {

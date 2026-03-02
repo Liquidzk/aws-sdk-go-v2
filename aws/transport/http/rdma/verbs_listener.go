@@ -24,6 +24,14 @@ type VerbsListenerOptions struct {
 	// AcceptWorkers controls concurrent RDMA accept workers.
 	// A value <= 0 uses DefaultVerbsAcceptWorkers.
 	AcceptWorkers int
+
+	// EnableMultiplex enables server-side logical stream demultiplexing over
+	// each accepted physical RDMA connection.
+	EnableMultiplex bool
+
+	// MultiplexSendQueueDepth controls buffered outgoing frame queue depth per
+	// physical connection in multiplex mode. Values <= 0 use defaults.
+	MultiplexSendQueueDepth int
 }
 
 // NewVerbsListener creates a net.Listener backed by RDMA verbs.
