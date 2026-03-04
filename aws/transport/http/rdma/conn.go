@@ -31,6 +31,36 @@ type MessageConn interface {
 	RemoteAddr() net.Addr
 }
 
+// BorrowedMessage is a message view that may alias transport-managed memory.
+// The caller must call Release once the payload is no longer needed.
+type BorrowedMessage struct {
+	Payload      []byte
+	SharedOffset int
+	release      func() error
+}
+
+// Release returns borrowed transport resources.
+func (m *BorrowedMessage) Release() error {
+	if m == nil || m.release == nil {
+		return nil
+	}
+	release := m.release
+	m.release = nil
+	return release()
+}
+
+// BorrowingMessageConn exposes a borrowed receive API for zero-copy consumers.
+type BorrowingMessageConn interface {
+	RecvBorrowedMessage(ctx context.Context) (*BorrowedMessage, error)
+}
+
+// MessageListener accepts message-oriented connections directly.
+type MessageListener interface {
+	AcceptMessage() (MessageConn, error)
+	Close() error
+	Addr() net.Addr
+}
+
 // messageFrameReposter is an optional capability for MessageConn
 // implementations that can explicitly repost a borrowed receive frame once the
 // consumer is done with it.

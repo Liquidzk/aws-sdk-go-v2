@@ -31,13 +31,15 @@ enum {
 	GO_RDMA_RW_THRESHOLD_BYTES = 64 * 1024,
 	// Per-connection remote-write receive buffer capacity is derived from
 	// frame_cap with bounds to avoid excessive MR memory footprint.
+	// Defaults are tuned to cover multi-MiB payloads in offset-based zcopy path.
 	GO_RDMA_RW_RECV_CAP_MIN_BYTES = 256 * 1024,
-	GO_RDMA_RW_RECV_CAP_MAX_BYTES = 1 * 1024 * 1024,
-	GO_RDMA_RW_RECV_CAP_FRAMES = 8,
+	GO_RDMA_RW_RECV_CAP_MAX_BYTES = 4 * 1024 * 1024,
+	GO_RDMA_RW_RECV_CAP_FRAMES = 32,
 	// Number of per-connection RW receive slots to reduce overwrite risk
 	// when multiple RW messages are in-flight.
 	GO_RDMA_RW_RECV_SLOTS = 8,
 	GO_RDMA_RW_NOTIFY_KIND_WRITE = 1,
+	GO_RDMA_RW_NOTIFY_KIND_WRITE_AT = 2,
 };
 
 #define GO_RDMA_RW_DESC_MAGIC 0x5244574445534331ULL
@@ -89,6 +91,7 @@ typedef struct {
 	struct ibv_mr *rw_recv_mr;
 	uint32_t rw_recv_cap;
 	uint32_t rw_recv_slots;
+	int rw_recv_external;
 	uint64_t peer_rw_addr;
 	uint32_t peer_rw_rkey;
 	uint32_t peer_rw_cap;
@@ -426,7 +429,9 @@ static void go_rdma_free_conn(go_rdma_conn *conn) {
 		conn->send_buf = NULL;
 	}
 	if (conn->rw_recv_buf != NULL) {
-		free(conn->rw_recv_buf);
+		if (!conn->rw_recv_external) {
+			free(conn->rw_recv_buf);
+		}
 		conn->rw_recv_buf = NULL;
 	}
 
@@ -496,6 +501,14 @@ static int go_rdma_send_message(
 	int timeout_ms,
 	char **err_out
 );
+static int go_rdma_send_message_rw_at(
+	go_rdma_conn *conn,
+	const uint8_t *payload,
+	uint32_t total_len,
+	uint32_t remote_offset,
+	int timeout_ms,
+	char **err_out
+);
 static int go_rdma_recv_frame(
 	go_rdma_conn *conn,
 	uint8_t **payload_ptr,
@@ -506,6 +519,13 @@ static int go_rdma_recv_frame(
 	char **err_out
 );
 static int go_rdma_release_last_recv_slot(go_rdma_conn *conn, char **err_out);
+static int go_rdma_get_rw_recv_payload_at(
+	go_rdma_conn *conn,
+	uint32_t remote_offset,
+	uint32_t payload_len,
+	uint8_t **payload_ptr,
+	char **err_out
+);
 
 static uint32_t go_rdma_choose_rw_recv_cap(uint32_t frame_cap) {
 	uint64_t cap = (uint64_t)frame_cap * (uint64_t)GO_RDMA_RW_RECV_CAP_FRAMES;
@@ -810,6 +830,8 @@ static int go_rdma_open(
 	uint32_t recv_wr,
 	uint32_t inline_threshold,
 	uint32_t send_signal_interval,
+	uint8_t *rw_mem,
+	uint32_t rw_mem_len,
 	int timeout_ms,
 	go_rdma_conn **out,
 	char **err_out
@@ -830,6 +852,19 @@ static int go_rdma_open(
 	}
 	if (send_signal_interval == 0) {
 		send_signal_interval = 1;
+	}
+	if (rw_mem == NULL && rw_mem_len > 0) {
+		go_rdma_set_err(err_out, "go_rdma_open: rw_mem_len provided but rw_mem is nil");
+		return EINVAL;
+	}
+	if (rw_mem != NULL && rw_mem_len < frame_cap) {
+		go_rdma_set_err(
+			err_out,
+			"go_rdma_open: external rw memory too small rw_mem_len=%u frame_cap=%u",
+			rw_mem_len,
+			frame_cap
+		);
+		return EINVAL;
 	}
 
 	struct rdma_addrinfo hints;
@@ -993,28 +1028,72 @@ static int go_rdma_open(
 		goto cleanup;
 	}
 
-	size_t rw_recv_cap = (size_t)go_rdma_choose_rw_recv_cap(frame_cap);
-	size_t rw_recv_slots = (size_t)GO_RDMA_RW_RECV_SLOTS;
-	size_t rw_recv_size = rw_recv_cap * rw_recv_slots;
-	if (rw_recv_slots > 0 && rw_recv_size / rw_recv_slots != rw_recv_cap) {
-		go_rdma_set_err(err_out, "rw recv region size overflow");
-		rc = EOVERFLOW;
-		goto cleanup;
-	}
-	conn->rw_recv_buf = (uint8_t *)malloc(rw_recv_size);
-	if (conn->rw_recv_buf == NULL) {
-		go_rdma_set_errno(err_out, "malloc rw recv buffer");
-		rc = errno != 0 ? errno : ENOMEM;
-		goto cleanup;
+	size_t rw_recv_cap = 0;
+	size_t rw_recv_slots = 0;
+	size_t rw_recv_size = 0;
+	if (rw_mem != NULL && rw_mem_len > 0) {
+		size_t rw_mem_total = (size_t)rw_mem_len;
+		conn->rw_recv_external = 1;
+		if (rw_mem_total > UINT32_MAX) {
+			go_rdma_set_err(
+				err_out,
+				"go_rdma_open: external rw memory too large rw_mem_len=%u max=%u",
+				rw_mem_len,
+				(uint32_t)UINT32_MAX
+			);
+			rc = EINVAL;
+			goto cleanup;
+		}
+		// External shared memory is fully registered so offset-based addressing
+		// can target arbitrary caller-owned regions.
+		rw_recv_cap = rw_mem_total;
+		rw_recv_slots = 1;
+		rw_recv_size = rw_mem_total;
+		conn->rw_recv_buf = rw_mem;
+	} else {
+		rw_recv_cap = (size_t)go_rdma_choose_rw_recv_cap(frame_cap);
+		rw_recv_slots = (size_t)GO_RDMA_RW_RECV_SLOTS;
+		rw_recv_size = rw_recv_cap * rw_recv_slots;
+		if (rw_recv_slots > 0 && rw_recv_size / rw_recv_slots != rw_recv_cap) {
+			go_rdma_set_err(err_out, "rw recv region size overflow");
+			rc = EOVERFLOW;
+			goto cleanup;
+		}
+		conn->rw_recv_buf = (uint8_t *)malloc(rw_recv_size);
+		if (conn->rw_recv_buf == NULL) {
+			go_rdma_set_errno(err_out, "malloc rw recv buffer");
+			rc = errno != 0 ? errno : ENOMEM;
+			goto cleanup;
+		}
 	}
 	conn->rw_recv_mr = ibv_reg_mr(
 		conn->pd,
 		conn->rw_recv_buf,
 		rw_recv_size,
-		IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE
+		IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ
 	);
 	if (conn->rw_recv_mr == NULL) {
-		go_rdma_set_errno(err_out, "ibv_reg_mr rw recv");
+		if (conn->rw_recv_external) {
+			if (errno == EFAULT) {
+				go_rdma_set_err(
+					err_out,
+					"ibv_reg_mr rw recv(external): %s (addr=%p len=%zu). hint: prefer anonymous or memfd-backed mmap for long-term RDMA pin",
+					strerror(errno),
+					(void *)conn->rw_recv_buf,
+					rw_recv_size
+				);
+			} else {
+				go_rdma_set_err(
+					err_out,
+					"ibv_reg_mr rw recv(external): %s (addr=%p len=%zu)",
+					strerror(errno),
+					(void *)conn->rw_recv_buf,
+					rw_recv_size
+				);
+			}
+		} else {
+			go_rdma_set_errno(err_out, "ibv_reg_mr rw recv");
+		}
 		rc = errno != 0 ? errno : EIO;
 		goto cleanup;
 	}
@@ -1621,11 +1700,31 @@ static int go_rdma_send_message_rw(
 			sge_addr = (uintptr_t)(payload + offset);
 			sge_lkey = payload_mr->lkey;
 		} else {
-			uint32_t local_slot = conn->tx_prod % conn->send_depth;
-			uint8_t *local_buf = conn->send_buf + ((size_t)local_slot * conn->frame_cap);
-			memcpy(local_buf, payload + offset, chunk_len);
-			sge_addr = (uintptr_t)local_buf;
-			sge_lkey = conn->send_mr->lkey;
+			int use_rw_recv_mr = 0;
+			if (conn->rw_recv_buf != NULL && conn->rw_recv_mr != NULL && conn->rw_recv_cap > 0 && conn->rw_recv_slots > 0) {
+				size_t rw_total = (size_t)conn->rw_recv_cap * (size_t)conn->rw_recv_slots;
+				if (rw_total / conn->rw_recv_slots == conn->rw_recv_cap) {
+					uintptr_t rw_begin = (uintptr_t)conn->rw_recv_buf;
+					uintptr_t payload_addr = (uintptr_t)(payload + offset);
+					if (payload_addr >= rw_begin) {
+						size_t rel = (size_t)(payload_addr - rw_begin);
+						if (rel <= rw_total && (size_t)chunk_len <= (rw_total - rel)) {
+							use_rw_recv_mr = 1;
+						}
+					}
+				}
+			}
+
+			if (use_rw_recv_mr) {
+				sge_addr = (uintptr_t)(payload + offset);
+				sge_lkey = conn->rw_recv_mr->lkey;
+			} else {
+				uint32_t local_slot = conn->tx_prod % conn->send_depth;
+				uint8_t *local_buf = conn->send_buf + ((size_t)local_slot * conn->frame_cap);
+				memcpy(local_buf, payload + offset, chunk_len);
+				sge_addr = (uintptr_t)local_buf;
+				sge_lkey = conn->send_mr->lkey;
+			}
 		}
 
 		struct ibv_sge sge;
@@ -1703,6 +1802,180 @@ cleanup:
 	return final_rc;
 }
 
+static int go_rdma_send_message_rw_at(
+	go_rdma_conn *conn,
+	const uint8_t *payload,
+	uint32_t total_len,
+	uint32_t remote_offset,
+	int timeout_ms,
+	char **err_out
+) {
+	if (conn == NULL || conn->id == NULL) {
+		go_rdma_set_err(err_out, "go_rdma_send_message_rw_at: conn closed");
+		return EBADF;
+	}
+	if (total_len == 0) {
+		return 0;
+	}
+	if (payload == NULL) {
+		go_rdma_set_err(err_out, "go_rdma_send_message_rw_at: payload is nil");
+		return EINVAL;
+	}
+	if (!conn->rw_ready || conn->peer_rw_addr == 0 || conn->peer_rw_rkey == 0 || conn->peer_rw_cap == 0 || conn->peer_rw_slots == 0) {
+		go_rdma_set_err(err_out, "go_rdma_send_message_rw_at: peer rw descriptor unavailable");
+		return ENOTSUP;
+	}
+	uint64_t peer_total = (uint64_t)conn->peer_rw_cap * (uint64_t)conn->peer_rw_slots;
+	if (peer_total == 0 || peer_total > UINT32_MAX) {
+		go_rdma_set_err(err_out, "go_rdma_send_message_rw_at: invalid peer rw window total=%llu", (unsigned long long)peer_total);
+		return EINVAL;
+	}
+	uint64_t end_off = (uint64_t)remote_offset + (uint64_t)total_len;
+	if (end_off > peer_total) {
+		go_rdma_set_err(
+			err_out,
+			"go_rdma_send_message_rw_at: payload out of range offset=%u payload=%u total=%llu",
+			remote_offset,
+			total_len,
+			(unsigned long long)peer_total
+		);
+		return EMSGSIZE;
+	}
+	if (conn->frame_cap == 0) {
+		go_rdma_set_err(err_out, "go_rdma_send_message_rw_at: invalid frame capacity");
+		return EINVAL;
+	}
+
+	struct ibv_mr *payload_mr = ibv_reg_mr(
+		conn->pd,
+		(void *)payload,
+		(size_t)total_len,
+		IBV_ACCESS_LOCAL_WRITE
+	);
+	int use_payload_mr = (payload_mr != NULL) ? 1 : 0;
+	uint32_t writes_start = conn->tx_prod;
+	int final_rc = 0;
+
+	uint32_t offset = 0;
+	uint64_t remote_base = conn->peer_rw_addr + (uint64_t)remote_offset;
+	while (offset < total_len) {
+		uint32_t remaining = total_len - offset;
+		uint32_t chunk_len = conn->frame_cap;
+		if (chunk_len > remaining) {
+			chunk_len = remaining;
+		}
+
+		int rc = go_rdma_wait_local_send_slot(conn, timeout_ms, err_out);
+		if (rc != 0) {
+			final_rc = rc;
+			goto cleanup;
+		}
+
+		uintptr_t sge_addr = 0;
+		uint32_t sge_lkey = 0;
+		if (use_payload_mr) {
+			sge_addr = (uintptr_t)(payload + offset);
+			sge_lkey = payload_mr->lkey;
+		} else {
+			int use_rw_recv_mr = 0;
+			if (conn->rw_recv_buf != NULL && conn->rw_recv_mr != NULL && conn->rw_recv_cap > 0 && conn->rw_recv_slots > 0) {
+				size_t rw_total = (size_t)conn->rw_recv_cap * (size_t)conn->rw_recv_slots;
+				if (rw_total / conn->rw_recv_slots == conn->rw_recv_cap) {
+					uintptr_t rw_begin = (uintptr_t)conn->rw_recv_buf;
+					uintptr_t payload_addr = (uintptr_t)(payload + offset);
+					if (payload_addr >= rw_begin) {
+						size_t rel = (size_t)(payload_addr - rw_begin);
+						if (rel <= rw_total && (size_t)chunk_len <= (rw_total - rel)) {
+							use_rw_recv_mr = 1;
+						}
+					}
+				}
+			}
+
+			if (use_rw_recv_mr) {
+				sge_addr = (uintptr_t)(payload + offset);
+				sge_lkey = conn->rw_recv_mr->lkey;
+			} else {
+				uint32_t local_slot = conn->tx_prod % conn->send_depth;
+				uint8_t *local_buf = conn->send_buf + ((size_t)local_slot * conn->frame_cap);
+				memcpy(local_buf, payload + offset, chunk_len);
+				sge_addr = (uintptr_t)local_buf;
+				sge_lkey = conn->send_mr->lkey;
+			}
+		}
+
+		struct ibv_sge sge;
+		memset(&sge, 0, sizeof(sge));
+		sge.addr = sge_addr;
+		sge.length = chunk_len;
+		sge.lkey = sge_lkey;
+
+		struct ibv_send_wr wr;
+		memset(&wr, 0, sizeof(wr));
+		wr.wr_id = (uintptr_t)conn->tx_prod;
+		wr.sg_list = &sge;
+		wr.num_sge = 1;
+		wr.opcode = IBV_WR_RDMA_WRITE;
+		wr.send_flags = IBV_SEND_SIGNALED;
+		wr.wr.rdma.remote_addr = remote_base + (uint64_t)offset;
+		wr.wr.rdma.rkey = conn->peer_rw_rkey;
+
+		struct ibv_send_wr *bad_wr = NULL;
+		rc = ibv_post_send(conn->id->qp, &wr, &bad_wr);
+		if (rc != 0) {
+			go_rdma_set_errno(err_out, "ibv_post_send(write_data_at)");
+			final_rc = errno != 0 ? errno : EIO;
+			goto cleanup;
+		}
+
+		conn->tx_prod++;
+		offset += chunk_len;
+	}
+
+	uint32_t writes_done_target = conn->tx_prod;
+	int rc = go_rdma_wait_send_completed_until(conn, writes_done_target, timeout_ms, err_out);
+	if (rc != 0) {
+		final_rc = rc;
+		goto cleanup;
+	}
+
+	go_rdma_rw_notify notify;
+	memset(&notify, 0, sizeof(notify));
+	notify.magic = GO_RDMA_RW_NOTIFY_MAGIC;
+	notify.kind = GO_RDMA_RW_NOTIFY_KIND_WRITE_AT;
+	notify.length = total_len;
+	notify.slot = remote_offset;
+
+	rc = go_rdma_send_message(
+		conn,
+		(const uint8_t *)&notify,
+		(uint32_t)sizeof(notify),
+		timeout_ms,
+		err_out
+	);
+	if (rc != 0) {
+		final_rc = rc;
+		goto cleanup;
+	}
+
+cleanup:
+	if (payload_mr != NULL) {
+		if ((int32_t)(conn->tx_prod - writes_start) > 0) {
+			int wait_rc = go_rdma_wait_send_completed_until(conn, conn->tx_prod, -1, NULL);
+			if (wait_rc != 0 && final_rc == 0) {
+				go_rdma_set_err(err_out, "go_rdma_send_message_rw_at: wait payload send completion failed rc=%d", wait_rc);
+				final_rc = wait_rc;
+			}
+		}
+		if (ibv_dereg_mr(payload_mr) != 0 && final_rc == 0) {
+			go_rdma_set_errno(err_out, "ibv_dereg_mr(payload)");
+			final_rc = errno != 0 ? errno : EIO;
+		}
+	}
+
+	return final_rc;
+}
+
 static int go_rdma_get_rw_recv_payload(
 	go_rdma_conn *conn,
 	uint32_t slot,
@@ -1741,6 +2014,41 @@ static int go_rdma_get_rw_recv_payload(
 		return EMSGSIZE;
 	}
 	*payload_ptr = conn->rw_recv_buf + ((size_t)slot * (size_t)conn->rw_recv_cap);
+	return 0;
+}
+
+static int go_rdma_get_rw_recv_payload_at(
+	go_rdma_conn *conn,
+	uint32_t remote_offset,
+	uint32_t payload_len,
+	uint8_t **payload_ptr,
+	char **err_out
+) {
+	if (conn == NULL || conn->id == NULL) {
+		go_rdma_set_err(err_out, "go_rdma_get_rw_recv_payload_at: conn closed");
+		return EBADF;
+	}
+	if (payload_ptr == NULL) {
+		go_rdma_set_err(err_out, "go_rdma_get_rw_recv_payload_at: nil payload_ptr");
+		return EINVAL;
+	}
+	if (!conn->rw_ready || conn->rw_recv_buf == NULL || conn->rw_recv_mr == NULL || conn->rw_recv_cap == 0 || conn->rw_recv_slots == 0) {
+		go_rdma_set_err(err_out, "go_rdma_get_rw_recv_payload_at: rw recv buffer unavailable");
+		return ENOTSUP;
+	}
+	uint64_t rw_total = (uint64_t)conn->rw_recv_cap * (uint64_t)conn->rw_recv_slots;
+	uint64_t end_off = (uint64_t)remote_offset + (uint64_t)payload_len;
+	if (end_off > rw_total) {
+		go_rdma_set_err(
+			err_out,
+			"go_rdma_get_rw_recv_payload_at: payload out of range offset=%u payload=%u total=%llu",
+			remote_offset,
+			payload_len,
+			(unsigned long long)rw_total
+		);
+		return EMSGSIZE;
+	}
+	*payload_ptr = conn->rw_recv_buf + (size_t)remote_offset;
 	return 0;
 }
 
@@ -1875,10 +2183,11 @@ const (
 	verbsOpenRetryBackoff   = 250 * time.Millisecond
 	verbsOpenAttemptLimit   = 8
 
-	rdmaWriteNotifyMagic = uint64(0x5244574e4f544659) // "RDWNOTFY"
-	rdmaWriteNotifyKind  = uint32(1)
-	rdmaWriteNotifySize  = 20
-	rdmaWriteDiagEnv     = "AWS_RDMA_RW_DIAG"
+	rdmaWriteNotifyMagic  = uint64(0x5244574e4f544659) // "RDWNOTFY"
+	rdmaWriteNotifyKind   = uint32(1)
+	rdmaWriteNotifyKindAt = uint32(2)
+	rdmaWriteNotifySize   = 20
+	rdmaWriteDiagEnv      = "AWS_RDMA_RW_DIAG"
 )
 
 func rdmaWriteDiagEnabled() bool {
@@ -1903,9 +2212,14 @@ type verbsMessageConn struct {
 	ready   bool
 
 	recvFrameMu sync.Mutex
+
+	// Keep caller-provided external shared memory alive for the lifetime of
+	// this connection when configured through VerbsOptions.SharedRWMemory.
+	sharedRWMemory []byte
 }
 
 var _ MessageConn = (*verbsMessageConn)(nil)
+var _ BorrowingMessageConn = (*verbsMessageConn)(nil)
 
 type verbsListener struct {
 	mu sync.RWMutex
@@ -1924,6 +2238,7 @@ type verbsListener struct {
 }
 
 var _ net.Listener = (*verbsListener)(nil)
+var _ MessageListener = (*verbsListener)(nil)
 
 func newVerbsListener(network, address string, opts VerbsListenerOptions) (net.Listener, error) {
 	cfg, err := opts.VerbsOptions.normalize()
@@ -2000,6 +2315,19 @@ func newVerbsListener(network, address string, opts VerbsListenerOptions) (net.L
 	return l, nil
 }
 
+func newVerbsMessageListener(network, address string, opts VerbsListenerOptions) (MessageListener, error) {
+	ln, err := newVerbsListener(network, address, opts)
+	if err != nil {
+		return nil, err
+	}
+	msgLn, ok := ln.(MessageListener)
+	if !ok {
+		_ = ln.Close()
+		return nil, errors.New("rdma verbs: listener does not support message accept")
+	}
+	return msgLn, nil
+}
+
 func splitHostPortListenAddress(network, address string) (host string, port string, err error) {
 	switch network {
 	case "", "tcp", "tcp4", "tcp6", "rdma", "rdma4", "rdma6":
@@ -2017,7 +2345,7 @@ func splitHostPortListenAddress(network, address string) (host string, port stri
 	return host, port, nil
 }
 
-func (l *verbsListener) Accept() (net.Conn, error) {
+func (l *verbsListener) AcceptMessage() (MessageConn, error) {
 	l.mu.RLock()
 	framePayloadSize := l.framePayloadSize
 	inlineThreshold := l.inlineThreshold
@@ -2041,8 +2369,16 @@ func (l *verbsListener) Accept() (net.Conn, error) {
 			remoteAddr:       rdmaAddr{network: "rdma", address: "remote"},
 			ready:            true,
 		}
-		return NewConn(msgConn), nil
+		return msgConn, nil
 	}
+}
+
+func (l *verbsListener) Accept() (net.Conn, error) {
+	msgConn, err := l.AcceptMessage()
+	if err != nil {
+		return nil, err
+	}
+	return NewConn(msgConn), nil
 }
 
 func (l *verbsListener) Close() error {
@@ -2205,6 +2541,7 @@ func (o VerbsOptions) Open(ctx context.Context, network, address string) (Messag
 				localAddr:        rdmaAddr{network: "rdma", address: "local"},
 				remoteAddr:       rdmaAddr{network: "rdma", address: net.JoinHostPort(host, port)},
 				ready:            true,
+				sharedRWMemory:   cfg.sharedRWMemory,
 			}, nil
 		}
 
@@ -2255,6 +2592,15 @@ func openVerbsConnOnce(ctx context.Context, host, port string, frameCap int, cfg
 		cPort := C.CString(port)
 		defer C.free(unsafe.Pointer(cPort))
 
+		var (
+			cSharedRWPtr *C.uint8_t
+			cSharedRWLen C.uint32_t
+		)
+		if len(cfg.sharedRWMemory) > 0 {
+			cSharedRWPtr = (*C.uint8_t)(unsafe.Pointer(&cfg.sharedRWMemory[0]))
+			cSharedRWLen = C.uint32_t(len(cfg.sharedRWMemory))
+		}
+
 		var result openResult
 		result.rc = C.go_rdma_open(
 			cHost,
@@ -2264,6 +2610,8 @@ func openVerbsConnOnce(ctx context.Context, host, port string, frameCap int, cfg
 			C.uint32_t(cfg.recvQueueDepth),
 			C.uint32_t(cfg.inlineThreshold),
 			C.uint32_t(cfg.sendSignalIntvl),
+			cSharedRWPtr,
+			cSharedRWLen,
 			openTimeoutMS,
 			&result.cConn,
 			&result.cErr,
@@ -2340,7 +2688,16 @@ func (c *verbsMessageConn) SendMessage(ctx context.Context, payload []byte) erro
 	var cErr *C.char
 	rc := C.int(0)
 	usedRW := false
-	useRWDataplane := len(payload) > c.inlineThreshold
+	rwFallbackToSend := false
+
+	// Keep control-plane sized frames on SEND to avoid clobbering RW shared
+	// memory windows that may be targeted by offset-based SendMessageAt writes.
+	// RW dataplane is still used for larger payloads.
+	rwCutover := c.inlineThreshold
+	if rwCutover < c.framePayloadSize {
+		rwCutover = c.framePayloadSize
+	}
+	useRWDataplane := len(payload) > rwCutover
 	if useRWDataplane {
 		rc = C.go_rdma_send_message_rw(
 			c.cc,
@@ -2351,6 +2708,19 @@ func (c *verbsMessageConn) SendMessage(ctx context.Context, payload []byte) erro
 		)
 		if rc == 0 {
 			usedRW = true
+		} else if rc == C.int(C.EMSGSIZE) || rc == C.int(C.ENOTSUP) {
+			if cErr != nil {
+				C.free(unsafe.Pointer(cErr))
+				cErr = nil
+			}
+			rwFallbackToSend = true
+			rc = C.go_rdma_send_message(
+				c.cc,
+				payloadPtr,
+				C.uint32_t(len(payload)),
+				timeoutMS,
+				&cErr,
+			)
 		}
 	} else {
 		rc = C.go_rdma_send_message(
@@ -2364,6 +2734,9 @@ func (c *verbsMessageConn) SendMessage(ctx context.Context, payload []byte) erro
 	if usedRW && rdmaWriteDiagEnabled() {
 		log.Printf("rdma rw send used len=%d", len(payload))
 	}
+	if rwFallbackToSend && rdmaWriteDiagEnabled() {
+		log.Printf("rdma rw fallback to send len=%d", len(payload))
+	}
 	runtime.KeepAlive(payload)
 	if rc != 0 {
 		if rc == C.int(C.EAGAIN) {
@@ -2372,10 +2745,63 @@ func (c *verbsMessageConn) SendMessage(ctx context.Context, payload []byte) erro
 			}
 			return context.DeadlineExceeded
 		}
-		if useRWDataplane {
+		if useRWDataplane && !rwFallbackToSend {
 			return rdmaCError("rw_send", rc, cErr)
 		}
 		return rdmaCError("send", rc, cErr)
+	}
+	return nil
+}
+
+// SendMessageAt sends payload through the RW data plane and targets a specific
+// offset in the peer shared memory region.
+func (c *verbsMessageConn) SendMessageAt(ctx context.Context, payload []byte, sharedOffset int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if sharedOffset < 0 {
+		return fmt.Errorf("rdma verbs: invalid shared offset %d", sharedOffset)
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.cc == nil {
+		return net.ErrClosed
+	}
+	if err := c.ensureReady(ctx); err != nil {
+		return err
+	}
+	timeoutMS, err := rdmaContextTimeoutMillis(ctx)
+	if err != nil {
+		return err
+	}
+
+	var payloadPtr *C.uint8_t
+	if len(payload) > 0 {
+		payloadPtr = (*C.uint8_t)(unsafe.Pointer(&payload[0]))
+	}
+
+	var cErr *C.char
+	rc := C.go_rdma_send_message_rw_at(
+		c.cc,
+		payloadPtr,
+		C.uint32_t(len(payload)),
+		C.uint32_t(sharedOffset),
+		timeoutMS,
+		&cErr,
+	)
+	runtime.KeepAlive(payload)
+	if rc != 0 {
+		if rc == C.int(C.EAGAIN) {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return context.DeadlineExceeded
+		}
+		return rdmaCError("rw_send_at", rc, cErr)
+	}
+	if rdmaWriteDiagEnabled() {
+		log.Printf("rdma rw send_at used len=%d off=%d", len(payload), sharedOffset)
 	}
 	return nil
 }
@@ -2455,21 +2881,38 @@ func (c *verbsMessageConn) RepostFrame() error {
 	return nil
 }
 
-func parseWriteNotifyFrame(frame []byte) (int, int, bool) {
+func parseWriteNotifyFrame(frame []byte) (length int, token int, at bool, ok bool) {
 	if len(frame) != rdmaWriteNotifySize {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 	magic := binary.LittleEndian.Uint64(frame[:8])
 	if magic != rdmaWriteNotifyMagic {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 	kind := binary.LittleEndian.Uint32(frame[8:12])
-	if kind != rdmaWriteNotifyKind {
-		return 0, 0, false
+	if kind != rdmaWriteNotifyKind && kind != rdmaWriteNotifyKindAt {
+		return 0, 0, false, false
 	}
-	length := binary.LittleEndian.Uint32(frame[12:16])
-	slot := binary.LittleEndian.Uint32(frame[16:20])
-	return int(length), int(slot), true
+	lengthU := binary.LittleEndian.Uint32(frame[12:16])
+	tokenU := binary.LittleEndian.Uint32(frame[16:20])
+	return int(lengthU), int(tokenU), kind == rdmaWriteNotifyKindAt, true
+}
+
+func (c *verbsMessageConn) sharedMemoryOffset(payload []byte) int {
+	if len(payload) == 0 || len(c.sharedRWMemory) == 0 {
+		return -1
+	}
+
+	sharedBase := uintptr(unsafe.Pointer(&c.sharedRWMemory[0]))
+	payloadBase := uintptr(unsafe.Pointer(&payload[0]))
+	if payloadBase < sharedBase {
+		return -1
+	}
+	rel := payloadBase - sharedBase
+	if rel > uintptr(len(c.sharedRWMemory)-len(payload)) {
+		return -1
+	}
+	return int(rel)
 }
 
 func (c *verbsMessageConn) getRWRecvPayload(slot int, length int) ([]byte, error) {
@@ -2501,7 +2944,42 @@ func (c *verbsMessageConn) getRWRecvPayload(slot int, length int) ([]byte, error
 	return unsafe.Slice((*byte)(unsafe.Pointer(payloadPtr)), length), nil
 }
 
-func (c *verbsMessageConn) RecvMessage(ctx context.Context) ([]byte, error) {
+func (c *verbsMessageConn) getRWRecvPayloadAt(sharedOffset int, length int) ([]byte, error) {
+	if sharedOffset < 0 {
+		return nil, fmt.Errorf("rdma verbs: invalid shared offset %d", sharedOffset)
+	}
+	if length < 0 {
+		return nil, fmt.Errorf("rdma verbs: invalid rw payload length %d", length)
+	}
+	if length == 0 {
+		return []byte{}, nil
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.cc == nil {
+		return nil, net.ErrClosed
+	}
+
+	var (
+		payloadPtr *C.uint8_t
+		cErr       *C.char
+	)
+	rc := C.go_rdma_get_rw_recv_payload_at(
+		c.cc,
+		C.uint32_t(sharedOffset),
+		C.uint32_t(length),
+		&payloadPtr,
+		&cErr,
+	)
+	if rc != 0 {
+		return nil, rdmaCError("rw_recv_payload_at", rc, cErr)
+	}
+
+	return unsafe.Slice((*byte)(unsafe.Pointer(payloadPtr)), length), nil
+}
+
+func (c *verbsMessageConn) RecvBorrowedMessage(ctx context.Context) (*BorrowedMessage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -2527,25 +3005,52 @@ func (c *verbsMessageConn) RecvMessage(ctx context.Context) ([]byte, error) {
 				frameTotalN, payloadLenN, offsetN,
 			)
 		}
-		if rwLen, rwSlot, ok := parseWriteNotifyFrame(payload); ok {
-			rwPayload, err := c.getRWRecvPayload(rwSlot, rwLen)
+		if rwLen, rwToken, rwAt, ok := parseWriteNotifyFrame(payload); ok {
+			var rwPayload []byte
+			var sharedOffset int
+			if rwAt {
+				rwPayload, err = c.getRWRecvPayloadAt(rwToken, rwLen)
+				sharedOffset = rwToken
+			} else {
+				rwPayload, err = c.getRWRecvPayload(rwToken, rwLen)
+				sharedOffset = c.sharedMemoryOffset(rwPayload)
+			}
 			if err != nil {
 				return nil, err
 			}
-			// RW receive buffer is a shared per-connection region that can be
-			// overwritten by the next inbound RW message. Materialize this
-			// message into owned memory before returning to stream adapter.
-			msg := append([]byte(nil), rwPayload...)
 			if err := c.RepostFrame(); err != nil {
 				return nil, err
 			}
 			if rdmaWriteDiagEnabled() {
-				log.Printf("rdma rw recv used len=%d", rwLen)
+				if rwAt {
+					log.Printf("rdma rw recv_at used len=%d off=%d", rwLen, rwToken)
+				} else {
+					log.Printf("rdma rw recv used len=%d", rwLen)
+				}
 			}
-			return msg, nil
+			return &BorrowedMessage{
+				Payload:      rwPayload,
+				SharedOffset: sharedOffset,
+			}, nil
 		}
-		return payload, nil
+		return &BorrowedMessage{
+			Payload:      payload,
+			SharedOffset: c.sharedMemoryOffset(payload),
+			release:      c.RepostFrame,
+		}, nil
 	}
+}
+
+func (c *verbsMessageConn) RecvMessage(ctx context.Context) ([]byte, error) {
+	msg, err := c.RecvBorrowedMessage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := append([]byte(nil), msg.Payload...)
+	if err := msg.Release(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *verbsMessageConn) repostRecvSlot() error {

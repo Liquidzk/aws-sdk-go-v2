@@ -66,6 +66,27 @@ func TestVerbsOptionsNormalizeLowCPU(t *testing.T) {
 	}
 }
 
+func TestVerbsOptionsNormalizeSharedRWMemory(t *testing.T) {
+	_, err := (VerbsOptions{
+		FramePayloadSize: 1024,
+		SharedRWMemory:   make([]byte, 512),
+	}).normalize()
+	if err == nil {
+		t.Fatalf("expected shared memory validation error")
+	}
+
+	cfg, err := (VerbsOptions{
+		FramePayloadSize: 1024,
+		SharedRWMemory:   make([]byte, 4096),
+	}).normalize()
+	if err != nil {
+		t.Fatalf("unexpected normalize error: %v", err)
+	}
+	if got := len(cfg.sharedRWMemory); got != 4096 {
+		t.Fatalf("sharedRWMemory length=%d", got)
+	}
+}
+
 func TestSplitHostPortAddress(t *testing.T) {
 	host, port, err := splitHostPortAddress("tcp", "10.0.1.1:7471")
 	if err != nil {

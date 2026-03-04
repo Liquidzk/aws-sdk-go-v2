@@ -53,6 +53,14 @@ type VerbsOptions struct {
 	// 1 means every frame; larger values reduce completion overhead.
 	// A value of 0 uses defaults (depends on LowCPU).
 	SendSignalInterval int
+
+	// SharedRWMemory, if provided, is used as the per-connection RW receive
+	// region on the client/open side. The region will be registered as one MR
+	// during connection initialization and reused by the RW data path.
+	//
+	// The caller owns the memory lifetime and must keep it valid until the
+	// connection is closed.
+	SharedRWMemory []byte
 }
 
 // NewVerbsDialer creates a Dialer that opens connections through RDMA verbs.
@@ -72,6 +80,7 @@ type verbsConfig struct {
 	inlineThreshold  int
 	sendSignalIntvl  int
 	lowCPU           bool
+	sharedRWMemory   []byte
 }
 
 func (o VerbsOptions) normalize() (verbsConfig, error) {
@@ -117,6 +126,12 @@ func (o VerbsOptions) normalize() (verbsConfig, error) {
 	}
 	if o.SendSignalInterval > 0 {
 		cfg.sendSignalIntvl = o.SendSignalInterval
+	}
+	if len(o.SharedRWMemory) > 0 {
+		if len(o.SharedRWMemory) < cfg.framePayloadSize {
+			return verbsConfig{}, fmt.Errorf("rdma verbs: shared rw memory size must be >= frame payload size")
+		}
+		cfg.sharedRWMemory = o.SharedRWMemory
 	}
 
 	return cfg, nil

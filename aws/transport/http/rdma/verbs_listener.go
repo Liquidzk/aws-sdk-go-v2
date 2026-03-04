@@ -30,3 +30,8 @@ type VerbsListenerOptions struct {
 func NewVerbsListener(network, address string, opts VerbsListenerOptions) (net.Listener, error) {
 	return newVerbsListener(network, address, opts)
 }
+
+// NewVerbsMessageListener creates a MessageListener backed by RDMA verbs.
+func NewVerbsMessageListener(network, address string, opts VerbsListenerOptions) (MessageListener, error) {
+	return newVerbsMessageListener(network, address, opts)
+}

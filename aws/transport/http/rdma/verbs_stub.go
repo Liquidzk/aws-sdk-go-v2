@@ -25,3 +25,8 @@ func newVerbsListener(network, address string, opts VerbsListenerOptions) (net.L
 	_, _, _ = network, address, opts
 	return nil, fmt.Errorf("rdma verbs backend unavailable; rebuild with -tags rdma and CGO_ENABLED=1")
 }
+
+func newVerbsMessageListener(network, address string, opts VerbsListenerOptions) (MessageListener, error) {
+	_, _, _ = network, address, opts
+	return nil, fmt.Errorf("rdma verbs backend unavailable; rebuild with -tags rdma and CGO_ENABLED=1")
+}
