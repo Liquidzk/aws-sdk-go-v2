@@ -35,19 +35,12 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"net"
 	"net/http"
-	"os"
-	"strconv"
 	"sync/atomic"
 	"time"
 )
 
 const ServiceID = "S3"
 const ServiceAPIVersion = "2006-03-01"
-
-const (
-	awsS3EnableRDMATransportEnv = "AWS_S3_RDMA_ENABLED"
-	awsS3DisableRDMAFallbackEnv = "AWS_S3_RDMA_DISABLE_FALLBACK"
-)
 
 type operationMetrics struct {
 	Duration                metrics.Float64Histogram
@@ -235,8 +228,6 @@ func New(options Options, optFns ...func(*Options)) *Client {
 	for _, fn := range optFns {
 		fn(&options)
 	}
-
-	finalizeRDMATransportHTTPClient(&options)
 
 	finalizeRetryMaxAttempts(&options)
 
@@ -543,53 +534,7 @@ func resolveHTTPClient(o *Options) {
 		})
 	}
 
-	buildable = resolveRDMATransportDialer(o, buildable)
-
 	o.HTTPClient = buildable
-}
-
-func resolveRDMATransportDialer(o *Options, buildable *awshttp.BuildableClient) *awshttp.BuildableClient {
-	if !isRDMATransportEnabled(o) {
-		return buildable
-	}
-
-	dialer := o.RDMADialer
-	if disableFallback, ok := resolveBoolEnv(awsS3DisableRDMAFallbackEnv); ok {
-		dialer.DisableFallback = disableFallback
-	}
-
-	return buildable.WithDialContext(dialer.DialContext)
-}
-
-func finalizeRDMATransportHTTPClient(o *Options) {
-	buildable, ok := o.HTTPClient.(*awshttp.BuildableClient)
-	if !ok {
-		return
-	}
-
-	o.HTTPClient = resolveRDMATransportDialer(o, buildable)
-}
-
-func isRDMATransportEnabled(o *Options) bool {
-	enabled := o.EnableRDMATransport || o.RDMADialer.Open != nil
-	if envEnabled, ok := resolveBoolEnv(awsS3EnableRDMATransportEnv); ok {
-		enabled = envEnabled
-	}
-	return enabled
-}
-
-func resolveBoolEnv(key string) (bool, bool) {
-	v, ok := os.LookupEnv(key)
-	if !ok {
-		return false, false
-	}
-
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		return false, false
-	}
-
-	return b, true
 }
 func resolveRetryer(o *Options) {
 	if o.Retryer != nil {

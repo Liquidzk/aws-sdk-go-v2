@@ -29,7 +29,8 @@ const (
 	DefaultVerbsLowCPUSendSignalInterval = 16
 )
 
-// VerbsOptions controls the RDMA verbs backend used by Dialer.Open.
+// VerbsOptions controls the RDMA verbs backend used by zero-copy message
+// connections.
 type VerbsOptions struct {
 	// FramePayloadSize controls max payload bytes sent in one RDMA SEND work
 	// request.
@@ -61,16 +62,6 @@ type VerbsOptions struct {
 	// The caller owns the memory lifetime and must keep it valid until the
 	// connection is closed.
 	SharedRWMemory []byte
-}
-
-// NewVerbsDialer creates a Dialer that opens connections through RDMA verbs.
-func NewVerbsDialer(opts VerbsOptions) Dialer {
-	return Dialer{
-		Open:            opts.Open,
-		OpenParallelism: DefaultOpenParallelism,
-		OpenMinInterval: DefaultOpenMinInterval,
-		state:           &dialerState{},
-	}
 }
 
 type verbsConfig struct {

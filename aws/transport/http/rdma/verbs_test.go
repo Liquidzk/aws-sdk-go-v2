@@ -120,10 +120,3 @@ func TestVerbsOpenUnavailableByDefaultBuild(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
-
-func TestNewVerbsDialer(t *testing.T) {
-	d := NewVerbsDialer(VerbsOptions{})
-	if d.Open == nil {
-		t.Fatalf("expected Open to be configured")
-	}
-}

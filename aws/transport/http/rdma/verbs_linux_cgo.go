@@ -2237,10 +2237,9 @@ type verbsListener struct {
 	closeOnce sync.Once
 }
 
-var _ net.Listener = (*verbsListener)(nil)
 var _ MessageListener = (*verbsListener)(nil)
 
-func newVerbsListener(network, address string, opts VerbsListenerOptions) (net.Listener, error) {
+func newVerbsMessageListener(network, address string, opts VerbsListenerOptions) (MessageListener, error) {
 	cfg, err := opts.VerbsOptions.normalize()
 	if err != nil {
 		return nil, err
@@ -2315,19 +2314,6 @@ func newVerbsListener(network, address string, opts VerbsListenerOptions) (net.L
 	return l, nil
 }
 
-func newVerbsMessageListener(network, address string, opts VerbsListenerOptions) (MessageListener, error) {
-	ln, err := newVerbsListener(network, address, opts)
-	if err != nil {
-		return nil, err
-	}
-	msgLn, ok := ln.(MessageListener)
-	if !ok {
-		_ = ln.Close()
-		return nil, errors.New("rdma verbs: listener does not support message accept")
-	}
-	return msgLn, nil
-}
-
 func splitHostPortListenAddress(network, address string) (host string, port string, err error) {
 	switch network {
 	case "", "tcp", "tcp4", "tcp6", "rdma", "rdma4", "rdma6":
@@ -2371,14 +2357,6 @@ func (l *verbsListener) AcceptMessage() (MessageConn, error) {
 		}
 		return msgConn, nil
 	}
-}
-
-func (l *verbsListener) Accept() (net.Conn, error) {
-	msgConn, err := l.AcceptMessage()
-	if err != nil {
-		return nil, err
-	}
-	return NewConn(msgConn), nil
 }
 
 func (l *verbsListener) Close() error {

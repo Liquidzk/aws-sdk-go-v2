@@ -32,7 +32,8 @@ func (r BufferRef) end() int {
 	return r.Offset + r.Size
 }
 
-// Config configures the specialized S3 RDMA zero-copy client.
+// Config configures the supported S3 RDMA zero-copy client path for this
+// repository.
 type Config struct {
 	Endpoint       string
 	RequestTimeout time.Duration
@@ -57,8 +58,8 @@ type offsetSender interface {
 	SendMessageAt(ctx context.Context, payload []byte, sharedOffset int) error
 }
 
-// Client is a specialized S3 client that operates on caller-provided shared
-// memory by offset/size.
+// Client is the supported RDMA S3 client surface for this repository. It
+// operates on caller-provided shared memory by offset and size.
 //
 // This client uses one RDMA connection with request multiplexing and
 // credit/ack flow control for borrowed get payloads.
@@ -89,8 +90,8 @@ type Client struct {
 	recvErr   error
 }
 
-// New initializes the client and configures RDMA transport to register and use
-// the provided shared memory region.
+// New initializes the zero-copy RDMA S3 client and configures the transport to
+// register and use the provided shared memory region.
 func New(cfg Config, sharedMemory []byte) (*Client, error) {
 	if len(sharedMemory) == 0 {
 		return nil, fmt.Errorf("s3rdmaclient: sharedMemory must not be empty")

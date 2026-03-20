@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
-	awsrdmahttp "github.com/aws/aws-sdk-go-v2/aws/transport/http/rdma"
 	internalauthsmithy "github.com/aws/aws-sdk-go-v2/internal/auth/smithy"
 	"github.com/aws/aws-sdk-go-v2/internal/v4a"
 	s3cust "github.com/aws/aws-sdk-go-v2/service/s3/internal/customizations"
@@ -174,18 +173,6 @@ type Options struct {
 	// Currently does not support per operation call overrides, may in the future.
 	resolvedDefaultsMode aws.DefaultsMode
 
-	// Enables using RDMA dialer integration for the client's HTTP transport.
-	//
-	// When true, the client wraps its HTTP dialing path with [RDMADialer]. If
-	// [RDMADialer.Open] is nil, TCP fallback dial is used.
-	EnableRDMATransport bool
-
-	// Configuration for RDMA-aware dialing in the client's HTTP transport.
-	//
-	// This is only applied when [EnableRDMATransport] is true, or when
-	// [RDMADialer.Open] is set.
-	RDMADialer awsrdmahttp.Dialer
-
 	// The HTTP client to invoke API calls with. Defaults to client's default HTTP
 	// implementation if nil.
 	HTTPClient HTTPClient
@@ -255,25 +242,6 @@ func WithEndpointResolver(v EndpointResolver) func(*Options) {
 func WithEndpointResolverV2(v EndpointResolverV2) func(*Options) {
 	return func(o *Options) {
 		o.EndpointResolverV2 = v
-	}
-}
-
-// WithEnableRDMATransport returns a functional option for enabling RDMA-aware
-// HTTP dialing behavior.
-func WithEnableRDMATransport(v bool) func(*Options) {
-	return func(o *Options) {
-		o.EnableRDMATransport = v
-	}
-}
-
-// WithRDMADialer returns a functional option for setting RDMA dialer behavior
-// for the S3 client's HTTP transport.
-func WithRDMADialer(v awsrdmahttp.Dialer) func(*Options) {
-	return func(o *Options) {
-		o.RDMADialer = v
-		if v.Open != nil {
-			o.EnableRDMATransport = true
-		}
 	}
 }
 

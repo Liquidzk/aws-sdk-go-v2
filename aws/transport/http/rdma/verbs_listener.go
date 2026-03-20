@@ -1,7 +1,5 @@
 package rdma
 
-import "net"
-
 const (
 	// DefaultVerbsListenBacklog is the default RDMA CM listen backlog.
 	DefaultVerbsListenBacklog = 512
@@ -26,12 +24,8 @@ type VerbsListenerOptions struct {
 	AcceptWorkers int
 }
 
-// NewVerbsListener creates a net.Listener backed by RDMA verbs.
-func NewVerbsListener(network, address string, opts VerbsListenerOptions) (net.Listener, error) {
-	return newVerbsListener(network, address, opts)
-}
-
-// NewVerbsMessageListener creates a MessageListener backed by RDMA verbs.
+// NewVerbsMessageListener creates the supported server-side RDMA listener for
+// the zero-copy message protocol used by s3rdmaclient.
 func NewVerbsMessageListener(network, address string, opts VerbsListenerOptions) (MessageListener, error) {
 	return newVerbsMessageListener(network, address, opts)
 }
