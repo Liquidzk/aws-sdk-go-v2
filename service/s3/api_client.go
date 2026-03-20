@@ -536,6 +536,7 @@ func resolveHTTPClient(o *Options) {
 
 	o.HTTPClient = buildable
 }
+
 func resolveRetryer(o *Options) {
 	if o.Retryer != nil {
 		return

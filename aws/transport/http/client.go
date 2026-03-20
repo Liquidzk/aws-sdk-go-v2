@@ -42,9 +42,8 @@ var (
 // of the BuildableClient. Only exported member values of the Transport and
 // optional Dialer will be copied between copies of BuildableClient.
 type BuildableClient struct {
-	transport   *http.Transport
-	dialer      *net.Dialer
-	dialContext dialContext
+	transport *http.Transport
+	dialer    *net.Dialer
 
 	initOnce sync.Once
 
@@ -74,14 +73,6 @@ func (b *BuildableClient) Do(req *http.Request) (*http.Response, error) {
 	return b.client.Do(req)
 }
 
-// CloseIdleConnections closes idle connections from the client's transport pool.
-func (b *BuildableClient) CloseIdleConnections() {
-	if b.client == nil {
-		return
-	}
-	b.client.CloseIdleConnections()
-}
-
 // Freeze returns a frozen aws.HTTPClient implementation that is no longer a BuildableClient.
 // Use this to prevent the SDK from applying DefaultMode configuration values to a buildable client.
 func (b *BuildableClient) Freeze() aws.HTTPClient {
@@ -101,7 +92,6 @@ func (b *BuildableClient) clone() *BuildableClient {
 	cpy := NewBuildableClient()
 	cpy.transport = b.GetTransport()
 	cpy.dialer = b.GetDialer()
-	cpy.dialContext = b.dialContext
 	cpy.clientTimeout = b.clientTimeout
 
 	return cpy
@@ -138,31 +128,7 @@ func (b *BuildableClient) WithDialerOptions(opts ...func(*net.Dialer)) *Buildabl
 	cpy.dialer = dialer
 
 	tr := cpy.GetTransport()
-	if cpy.dialContext != nil {
-		tr.DialContext = cpy.dialContext
-	} else {
-		tr.DialContext = cpy.dialer.DialContext
-	}
-	cpy.transport = tr
-
-	return cpy
-}
-
-// WithDialContext copies the BuildableClient and returns it with the
-// provided dial function applied to the client's http.Transport.
-//
-// If dialContext is nil, this method clears any previously configured
-// custom dial function and uses the client's current net.Dialer behavior.
-func (b *BuildableClient) WithDialContext(dialContext func(context.Context, string, string) (net.Conn, error)) *BuildableClient {
-	cpy := b.clone()
-	cpy.dialContext = dialContext
-
-	tr := cpy.GetTransport()
-	if cpy.dialContext != nil {
-		tr.DialContext = cpy.dialContext
-	} else {
-		tr.DialContext = cpy.GetDialer().DialContext
-	}
+	tr.DialContext = cpy.dialer.DialContext
 	cpy.transport = tr
 
 	return cpy
@@ -375,10 +341,4 @@ func (t suppressBadHTTPRedirectTransport) RoundTrip(r *http.Request) (*http.Resp
 	}
 
 	return resp, err
-}
-
-func (t suppressBadHTTPRedirectTransport) CloseIdleConnections() {
-	if tr, ok := t.tr.(interface{ CloseIdleConnections() }); ok {
-		tr.CloseIdleConnections()
-	}
 }
