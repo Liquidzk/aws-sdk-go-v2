@@ -24,6 +24,9 @@ enum {
 	// Keep only a short spin window, then yield to event/low-frequency wait.
 	GO_RDMA_POLL_SPINS = 2,
 	GO_RDMA_POLL_SLEEP_US = 1000,
+	// Bound server-side accept idle wait so listener close can stop accept
+	// workers promptly without relying on a peer event to wake rdma_get_cm_event.
+	GO_RDMA_ACCEPT_POLL_TIMEOUT_MS = 100,
 	// Bound server-side accept handshake so one bad peer does not stall Accept.
 	// Keep this reasonably large to tolerate connection bursts.
 	GO_RDMA_ACCEPT_HANDSHAKE_TIMEOUT_MS = 15000,
@@ -1279,6 +1282,23 @@ static int go_rdma_accept(
 	struct rdma_cm_id *id = NULL;
 	struct rdma_cm_event *event = NULL;
 	for (;;) {
+		struct pollfd pfd;
+		memset(&pfd, 0, sizeof(pfd));
+		pfd.fd = listener->cm_channel->fd;
+		pfd.events = POLLIN;
+
+		int poll_rc = poll(&pfd, 1, GO_RDMA_ACCEPT_POLL_TIMEOUT_MS);
+		if (poll_rc == 0) {
+			return EAGAIN;
+		}
+		if (poll_rc < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			go_rdma_set_errno(err_out, "poll(accept)");
+			return errno != 0 ? errno : EIO;
+		}
+
 		int rc = rdma_get_cm_event(listener->cm_channel, &event);
 		if (rc != 0) {
 			go_rdma_set_errno(err_out, "rdma_get_cm_event(accept)");
@@ -2161,7 +2181,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"runtime"
@@ -2170,6 +2189,8 @@ import (
 	"sync"
 	"time"
 	"unsafe"
+
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -2238,6 +2259,8 @@ type verbsListener struct {
 }
 
 var _ MessageListener = (*verbsListener)(nil)
+
+var errRdmaAcceptTimeout = errors.New("rdma accept timeout")
 
 func newVerbsMessageListener(network, address string, opts VerbsListenerOptions) (MessageListener, error) {
 	cfg, err := opts.VerbsOptions.normalize()
@@ -2367,11 +2390,10 @@ func (l *verbsListener) Close() error {
 		close(l.done)
 		l.mu.Unlock()
 
+		l.workerWg.Wait()
 		if cListener != nil {
 			C.go_rdma_listener_close(cListener)
 		}
-
-		l.workerWg.Wait()
 		close(l.acceptOut)
 	})
 	return nil
@@ -2407,17 +2429,25 @@ func (l *verbsListener) acceptWorker() {
 			return
 		}
 
-		var cConn *C.go_rdma_conn
-		var cErr *C.char
-		rc := C.go_rdma_accept(cListener, &cConn, &cErr)
-		if rc != 0 {
+		cConn, err := l.acceptOnce(cListener)
+		if err != nil {
+			if errors.Is(err, errRdmaAcceptTimeout) {
+				l.mu.RLock()
+				closed := l.cl == nil
+				l.mu.RUnlock()
+				if closed {
+					return
+				}
+				continue
+			}
+
 			now := time.Now()
 			if now.Sub(lastErrLog) >= errLogInterval {
 				if suppressedErrs > 0 {
-					log.Printf("rdma accept worker error: %v (suppressed=%d)", rdmaCError("accept", rc, cErr), suppressedErrs)
+					log.Printf("rdma accept worker error: %v (suppressed=%d)", err, suppressedErrs)
 					suppressedErrs = 0
 				} else {
-					log.Printf("rdma accept worker error: %v", rdmaCError("accept", rc, cErr))
+					log.Printf("rdma accept worker error: %v", err)
 				}
 				lastErrLog = now
 			} else {
@@ -2446,6 +2476,19 @@ func (l *verbsListener) acceptWorker() {
 		case l.acceptOut <- cConn:
 		}
 	}
+}
+
+func (l *verbsListener) acceptOnce(cListener *C.go_rdma_listener) (*C.go_rdma_conn, error) {
+	var cConn *C.go_rdma_conn
+	var cErr *C.char
+	rc := C.go_rdma_accept(cListener, &cConn, &cErr)
+	if rc != 0 {
+		if rc == C.int(C.EAGAIN) {
+			return nil, errRdmaAcceptTimeout
+		}
+		return nil, rdmaCError("accept", rc, cErr)
+	}
+	return cConn, nil
 }
 
 // Open opens a MessageConn backed by librdmacm + libibverbs.
